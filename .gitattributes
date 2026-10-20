@@ -1,0 +1,8 @@
+# 批处理文件必须是 CRLF，否则 cmd.exe 解析会出错
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 脚本与文档统一用 LF
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf

@@ -1,0 +1,24 @@
+# 依赖目录（由 setup_deps.py 生成，体积很大，不入库）
+pkgs/
+_download/
+
+# 运行输出
+xic_out/
+selftest_out/
+rangetest_out/
+*.csv
+*.png
+
+# 本地配置
+xic_gui_config.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 系统
+.DS_Store
+Thumbs.db
+desktop.ini
