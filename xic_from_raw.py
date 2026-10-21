@@ -214,37 +214,89 @@ def cjk_font():
     return None
 
 
-def plot_overlay(traces, target_mz, tol, tol_type, out_png, label_en=False):
+def _label_for(path, names):
+    """找出这条曲线该显示的名字：支持按完整路径 / 文件名 / 不含扩展名的名字匹配。"""
+    if not names:
+        return os.path.basename(path)
+    stem = os.path.splitext(os.path.basename(path))[0]
+    for key in (path, os.path.abspath(path), os.path.basename(path), stem):
+        v = names.get(key)
+        if v:
+            return v
+    return os.path.basename(path)
+
+
+def _axis_label(name, unit):
+    name = (name or "").strip()
+    unit = (unit or "").strip()
+    if unit:
+        return f"{name} ({unit})" if name else unit
+    return name
+
+
+def plot_overlay(traces, target_mz, tol, tol_type, out_png,
+                 label_en=False, style=None):
+    """
+    把多条曲线画在一张图上并存成 PNG。
+
+    style 支持的键（不传就用默认值，传空字符串则表示"留白不要"）：
+        title    图标题
+        x_name   X 轴名称      x_unit  X 轴单位
+        y_name   Y 轴名称      y_unit  Y 轴单位
+        dpi      图片分辨率（默认 130）
+        figsize  画布尺寸（默认 11×5 英寸）
+        names    {路径或文件名: 曲线显示名}
+        legend   是否显示图例（默认：多条曲线或有自定义名称时显示）
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    style = style or {}
     font = cjk_font()
     if font:
         plt.rcParams["font.sans-serif"] = [font]
     plt.rcParams["axes.unicode_minus"] = False
     cn = bool(font) and not label_en
 
-    fig, ax = plt.subplots(figsize=(11, 5), dpi=130)
-    for name, rows in traces:
+    tol_unit = "ppm" if tol_type == "ppm" else "Da"
+    names = style.get("names") or {}
+
+    dpi = int(style.get("dpi") or 130)
+    figsize = style.get("figsize") or (11, 5)
+
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+    for path, rows in traces:
         if not rows:
             continue
         x = np.array([r["RT_min"] for r in rows])
         y = np.array([r["intensity_sum"] for r in rows])
-        ax.plot(x, y, linewidth=1.0, label=os.path.basename(name))
+        ax.plot(x, y, linewidth=1.0, label=_label_for(path, names))
 
-    unit = "ppm" if tol_type == "ppm" else "Da"
-    if cn:
-        ax.set_xlabel("保留时间 (min)")
-        ax.set_ylabel("强度（窗口内累加）")
-        ax.set_title(f"m/z {target_mz} ±{tol} {unit} 的提取离子色谱")
-    else:
-        ax.set_xlabel("Retention time (min)")
-        ax.set_ylabel("Intensity (sum in window)")
-        ax.set_title(f"XIC of m/z {target_mz} +/- {tol} {unit}")
+    # 名称/单位：None 表示用默认，"" 表示留空
+    x_name = style.get("x_name")
+    x_name = ("保留时间" if cn else "Retention time") if x_name is None else x_name
+    x_unit = "min" if style.get("x_unit") is None else style.get("x_unit")
+
+    y_name = style.get("y_name")
+    y_name = ("强度（窗口内累加）" if cn else "Intensity (sum in window)") \
+        if y_name is None else y_name
+    y_unit = "" if style.get("y_unit") is None else style.get("y_unit")
+
+    title = style.get("title")
+    if title is None:
+        title = (f"m/z {target_mz} ±{tol} {tol_unit} 的提取离子色谱" if cn
+                 else f"XIC of m/z {target_mz} +/- {tol} {tol_unit}")
+
+    ax.set_xlabel(_axis_label(x_name, x_unit))
+    ax.set_ylabel(_axis_label(y_name, y_unit))
+    ax.set_title(title)
 
     ax.grid(alpha=0.3)
-    if len(traces) > 1:
+    show_legend = style.get("legend")
+    if show_legend is None:
+        show_legend = len(traces) > 1 or bool(names)
+    if show_legend and any(rows for _, rows in traces):
         ax.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(out_png)
@@ -328,7 +380,43 @@ def main():
     ap.add_argument("--out", default="xic_out", help="输出目录（默认 ./xic_out）")
     ap.add_argument("--no-plot", action="store_true")
     ap.add_argument("--label-en", action="store_true", help="图片标签用英文")
+
+    # 图片外观
+    ap.add_argument("--title", default=None,
+                    help='图标题；写 none 表示不要标题（PowerShell 里 "" 会被吞掉）')
+    ap.add_argument("--x-name", default=None, help="X 轴名称（默认：保留时间）")
+    ap.add_argument("--x-unit", default=None, help="X 轴单位（默认：min；写 none 表示不显示）")
+    ap.add_argument("--y-name", default=None, help="Y 轴名称（默认：强度）")
+    ap.add_argument("--y-unit", default=None, help="Y 轴单位（默认：空；写 none 表示不显示）")
+    ap.add_argument("--dpi", type=int, default=130, help="图片分辨率，默认 130")
+    ap.add_argument("--name", action="append", metavar="文件=显示名",
+                    help='自定义曲线名称，可重复。例：--name "100.raw=100 度"')
     args = ap.parse_args()
+
+    # 解析 --name 列表
+    curve_names = {}
+    for item in (args.name or []):
+        if "=" not in item:
+            print(f"[警告] --name 需要「文件=显示名」格式，已忽略：{item}", file=sys.stderr)
+            continue
+        k, v = item.split("=", 1)
+        curve_names[k.strip()] = v.strip()
+
+    # PowerShell 会把空字符串参数吞掉，所以用 none / null 表示"留空"
+    def blank_if_sentinel(v):
+        if v is None:
+            return None
+        return "" if v.strip().lower() in ("none", "null", "empty") else v
+
+    plot_style = {
+        "title": blank_if_sentinel(args.title),
+        "x_name": blank_if_sentinel(args.x_name),
+        "x_unit": blank_if_sentinel(args.x_unit),
+        "y_name": blank_if_sentinel(args.y_name),
+        "y_unit": blank_if_sentinel(args.y_unit),
+        "dpi": args.dpi,
+        "names": curve_names,
+    }
 
     try:
         load_pyopenms()
@@ -385,7 +473,7 @@ def main():
         png = os.path.join(args.out, f"XIC_{tag}_overlay.png")
         try:
             plot_overlay(traces, args.mz, args.tol, args.tol_type, png,
-                         label_en=args.label_en)
+                         label_en=args.label_en, style=plot_style)
             print(f"\n曲线图 → {png}")
         except Exception as e:
             print(f"\n[警告] 画图失败（CSV 已正常输出）：{e}")
