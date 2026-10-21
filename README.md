@@ -7,6 +7,7 @@
 ## 功能
 
 - **直接读 `.raw`** —— Agilent / Thermo 的原始文件免转换
+- **两种提取模式** —— 指定 m/z 的提取离子色谱（XIC），或总离子流色谱（TIC）
 - **图形界面** —— 双击即可用，选文件、填 m/z、点一下出图
 - **批量处理** —— 一次跑整个目录，自动生成多条曲线对比图
 - **时间范围可选** —— 只看某一段色谱，不填就是整个文件
@@ -37,8 +38,11 @@ Windows 用户也可以直接双击 `安装依赖.cmd`，它会先试 pip，失�
 双击 `一键提取曲线.cmd`，然后：
 
 1. 「选择文件…」挑单个 `.raw`，或「选择文件夹…」把整个目录加进来
-2. 填目标 **m/z**
-3. 时间范围：保持勾选「取整个文件的时间」，或取消勾选后填起止分钟（留空表示该端不限）
+2. **提取类型**：
+   - 「指定 m/z（XIC）」—— 填一个 m/z，只看这个离子的信号
+   - 「总离子流（TIC）」—— 每个时刻所有离子强度之和，不用填 m/z
+3. 填目标 **m/z**（选 TIC 时这两项会自动变灰）
+4. 时间范围：保持勾选「取整个文件的时间」，或取消勾选后填起止分钟（留空表示该端不限）
 4. **图片设置**（可选）：
    - 标题：勾着「自动生成标题」就由程序按 m/z 生成；取消勾选后可自己写，留空则不显示标题
    - X/Y 轴名称与单位：单位留空则只显示名称
@@ -48,7 +52,7 @@ Windows 用户也可以直接双击 `安装依赖.cmd`，它会先试 pip，失�
 
 跑完后：
 
-- 结果 CSV 和 `XIC_<mz>_overlay.png` 写入输出目录
+- 结果 CSV 和 `XIC_<mz>_overlay.png`（TIC 模式为 `TIC_tic_overlay.png`）写入输出目录
 - 窗口切到「曲线预览」显示图形
 - 改完标题/轴名/曲线名后点 **「重新生成图」**，即时重绘，不用重新提取
 - 点 **「导出图片…」** 可另存到你指定的任意路径
@@ -62,6 +66,9 @@ python xic_from_raw.py "D:\\data\\sample.raw" --mz 58.83
 # 整个目录
 python xic_from_raw.py "D:\\data\\runs" --mz 58.83
 
+# 总离子流色谱图 TIC（不需要 --mz）
+python xic_from_raw.py "D:\\data\\runs" --tic
+
 # 只取 1.0–2.0 分钟这一段
 python xic_from_raw.py "D:\\data\\runs" --mz 58.83 --rt-range 1.0 2.0
 
@@ -74,7 +81,8 @@ python xic_from_raw.py "D:\\data\\runs" --mz 58.83 --tol 20 --tol-type ppm
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `inputs` | 必填 | `.raw` 文件、目录或通配符，可给多个 |
-| `--mz` | 必填 | 目标 m/z |
+| `--mz` | — | 目标 m/z；用 `--tic` 时可省略 |
+| `--tic` | 关 | 提取总离子流色谱（每个时刻所有离子强度之和） |
 | `--tol` | `0.01` | 容差；配合 `--tol-type ppm` 时表示 ppm 数 |
 | `--tol-type` | `da` | `da` 或 `ppm` |
 | `--mode` | `sum` | 窗口内强度取和 `sum` 或取最大值 `max` |
@@ -117,13 +125,15 @@ python xic_from_raw.py "D:\\data\\runs" --mz 58.83 \\
 | 列 | 含义 |
 |---|---|
 | `RT_min` / `RT_sec` | 保留时间（分 / 秒） |
-| `intensity_sum` | 窗口内强度累加 |
-| `intensity_max` | 窗口内最强点的强度 |
-| `n_points` | 窗口内命中的数据点数 |
-| `nearest_mz` | 窗口内最强点的实际 m/z |
+| `intensity_sum` | XIC 模式：窗口内强度累加；TIC 模式：该时刻全部离子强度之和 |
+| `intensity_max` | 窗口内最强点的强度；TIC 模式下即为该时刻**基峰强度** |
+| `n_points` | XIC：窗口内命中的数据点数；TIC：该谱总峰数 |
+| `nearest_mz` | 窗口内最强点的实际 m/z；TIC 模式下即为该时刻的基峰 m/z |
 | `nearest_intensity` | 该点强度 |
 
-多文件时另有一张 `XIC_<mz>_overlay.png` 叠加对比图。
+多文件时另有一张 `XIC_<mz>_overlay.png`（TIC 为 `TIC_tic_overlay.png`）叠加对比图。
+
+> TIC 模式的 CSV 里已经同时包含基峰色谱（BPC）所需的数据：把 `intensity_max` 这一列画出来就是 BPC，不必另外跑一遍。
 
 ## 实现中踩过的几个坑
 

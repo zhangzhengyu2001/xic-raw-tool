@@ -25,6 +25,7 @@ CONFIG_PATH = os.path.join(HERE, "xic_gui_config.json")
 
 DEFAULTS = {
     # 提取参数
+    "extract_mode": "xic",     # xic = 按 m/z 提取；tic = 总离子流
     "mz": "58.83",
     "tol": "0.01",
     "tol_type": "da",
@@ -68,7 +69,9 @@ def save_config(cfg):
 def run_extraction(files, args, out_dir, log, style=None):
     """跑完全部文件。返回 (png路径, 成功数, 失败列表, traces)"""
     os.makedirs(out_dir, exist_ok=True)
-    tag = f"{args.mz:g}".replace(".", "p")
+    tic = bool(getattr(args, "tic", False))
+    tag = "tic" if tic else f"{args.mz:g}".replace(".", "p")
+    prefix = "TIC" if tic else "XIC"
     traces, failed = [], []
 
     for p in files:
@@ -85,15 +88,16 @@ def run_extraction(files, args, out_dir, log, style=None):
             log(f"  跳过：该文件没有符合 ms level 的谱，分布 {info['hist']}")
             continue
 
-        csv_path = os.path.join(
-            out_dir, f"{os.path.splitext(os.path.basename(p))[0]}_xic_{tag}.csv")
+        fname = (f"{os.path.splitext(os.path.basename(p))[0]}_tic.csv" if tic
+                 else f"{os.path.splitext(os.path.basename(p))[0]}_xic_{tag}.csv")
+        csv_path = os.path.join(out_dir, fname)
         core.write_csv(rows, csv_path)
         traces.append((p, rows))
 
         log(f"  谱图数 {info['n_used']}，时间 {info['rt_first']/60:.2f}~{info['rt_last']/60:.2f} min")
         if info.get("apex_rt") is not None:
             log(f"  最强处 RT={info['apex_rt']:.3f} min，强度={info['apex_int']:.4g}")
-        else:
+        elif not tic:
             log("  警告：该 m/z 窗口内没有信号")
             for m, i in (info.get("diagnostic") or [])[:5]:
                 log(f"      附近有峰 m/z={m:.4f} 强度={i:.4g}")
@@ -101,10 +105,10 @@ def run_extraction(files, args, out_dir, log, style=None):
 
     png = None
     if traces:
-        png = os.path.join(out_dir, f"XIC_{tag}_overlay.png")
+        png = os.path.join(out_dir, f"{prefix}_{tag}_overlay.png")
         try:
-            core.plot_overlay(traces, args.mz, args.tol, args.tol_type, png,
-                              style=style)
+            core.plot_overlay(traces, args.mz if args.mz is not None else 0.0,
+                              args.tol, args.tol_type, png, style=style)
         except Exception as e:
             log(f"  画图失败：{e}")
             png = None
@@ -232,17 +236,39 @@ def main():
     frm_par = ttk.LabelFrame(root, text="2. 提取参数")
     frm_par.pack(fill="x", padx=10, pady=6)
 
+    row0 = ttk.Frame(frm_par)
+    row0.pack(fill="x", padx=10, pady=(8, 2))
+    ttk.Label(row0, text="提取类型：").pack(side="left")
+    mode_var = tk.StringVar(value=cfg.get("extract_mode", "xic"))
+    ttk.Radiobutton(row0, text="指定 m/z（XIC）", variable=mode_var,
+                    value="xic").pack(side="left")
+    ttk.Radiobutton(row0, text="总离子流（TIC，不需要填 m/z）", variable=mode_var,
+                    value="tic").pack(side="left", padx=(12, 0))
+
     row1 = ttk.Frame(frm_par)
-    row1.pack(fill="x", padx=10, pady=(8, 4))
+    row1.pack(fill="x", padx=10, pady=(2, 4))
     ttk.Label(row1, text="目标 m/z：").pack(side="left")
     mz_var = tk.StringVar(value=cfg["mz"])
-    ttk.Entry(row1, textvariable=mz_var, width=12).pack(side="left")
-    ttk.Label(row1, text="    容差：").pack(side="left")
+    mz_entry = ttk.Entry(row1, textvariable=mz_var, width=12)
+    mz_entry.pack(side="left")
+    tol_label = ttk.Label(row1, text="    容差：")
+    tol_label.pack(side="left")
     tol_var = tk.StringVar(value=cfg["tol"])
-    ttk.Entry(row1, textvariable=tol_var, width=8).pack(side="left")
+    tol_entry = ttk.Entry(row1, textvariable=tol_var, width=8)
+    tol_entry.pack(side="left")
     unit_var = tk.StringVar(value=cfg["tol_type"])
-    ttk.Combobox(row1, textvariable=unit_var, values=["da", "ppm"],
-                 width=5, state="readonly").pack(side="left", padx=(4, 0))
+    unit_box = ttk.Combobox(row1, textvariable=unit_var, values=["da", "ppm"],
+                            width=5, state="readonly")
+    unit_box.pack(side="left", padx=(4, 0))
+
+    def toggle_mode(*_):
+        st = "disabled" if mode_var.get() == "tic" else "normal"
+        for w in (mz_entry, tol_entry):
+            w.configure(state=st)
+        unit_box.configure(state="disabled" if st == "disabled" else "readonly")
+
+    mode_var.trace_add("write", toggle_mode)
+    toggle_mode()
 
     row2 = ttk.Frame(frm_par)
     row2.pack(fill="x", padx=10, pady=4)
@@ -392,10 +418,12 @@ def main():
             "y_unit": y_unit_var.get(),
             "dpi": dpi,
             "names": {k: v for k, v in name_map.items() if v},
+            "kind": "tic" if mode_var.get() == "tic" else "xic",
         }
 
     def persist():
         save_config({
+            "extract_mode": mode_var.get(),
             "mz": mz_var.get(), "tol": tol_var.get(), "tol_type": unit_var.get(),
             "whole_file": whole_var.get(),
             "rt_start": rt_start_var.get(), "rt_end": rt_end_var.get(),
@@ -449,11 +477,15 @@ def main():
             messagebox.showinfo("提示", "还没有提取结果，请先点「开始提取」。")
             return
         persist()
-        tag = f"{state['args'].mz:g}".replace(".", "p")
+        if getattr(state["args"], "tic", False):
+            default_name = "TIC.png"
+        else:
+            tag = f"{state['args'].mz:g}".replace(".", "p")
+            default_name = f"XIC_{tag}.png"
         path = filedialog.asksaveasfilename(
             title="导出图片",
             defaultextension=".png",
-            initialfile=f"XIC_{tag}.png",
+            initialfile=default_name,
             initialdir=state["out"] or out_var.get().strip() or HERE,
             filetypes=[("PNG 图片", "*.png")])
         if path:
@@ -486,13 +518,17 @@ def main():
         if not files:
             messagebox.showwarning("还没选文件", "请先选择 .raw 文件或文件夹。")
             return
+        is_tic = mode_var.get() == "tic"
+
+        mz = None
+        if not is_tic:
+            try:
+                mz = float(mz_var.get())
+            except ValueError:
+                messagebox.showerror("参数错误", "目标 m/z 必须是数字，例如 58.83")
+                return
         try:
-            mz = float(mz_var.get())
-        except ValueError:
-            messagebox.showerror("参数错误", "目标 m/z 必须是数字，例如 58.83")
-            return
-        try:
-            tol = float(tol_var.get())
+            tol = float(tol_var.get() or 0.01)
         except ValueError:
             messagebox.showerror("参数错误", "容差必须是数字，例如 0.01")
             return
@@ -523,7 +559,7 @@ def main():
 
         args = types.SimpleNamespace(mz=mz, tol=tol, tol_type=unit_var.get(),
                                      mode="sum", ms_level="auto", centroid=False,
-                                     rt_range=rt_range)
+                                     rt_range=rt_range, tic=is_tic)
         style = collect_style()
 
         run_btn.configure(state="disabled")

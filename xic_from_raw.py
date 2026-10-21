@@ -126,7 +126,14 @@ def resolve_ms_level(hist, want):
 
 
 # ------------------------------------------------------------------ 提取
-def extract_trace(exp, target_mz, tol, tol_type, mode, ms_level, rt_limit):
+def extract_trace(exp, target_mz, tol, tol_type, mode, ms_level, rt_limit,
+                  tic=False):
+    """
+    逐张谱提取强度。
+
+    tic=True 时不看 m/z，直接把该谱所有峰的强度加和（总离子流），
+    此时 intensity_max 列即为该时刻的基峰强度（可选作 BPC 用）。
+    """
     rows = []
     for spec in exp:
         if ms_level is not None and spec.getMSLevel() != ms_level:
@@ -141,19 +148,21 @@ def extract_trace(exp, target_mz, tol, tol_type, mode, ms_level, rt_limit):
         if mz is None or len(mz) == 0:
             continue
 
-        half = target_mz * tol * 1e-6 if tol_type == "ppm" else tol
-        mask = (mz >= target_mz - half) & (mz <= target_mz + half)
-        n_hit = int(mask.sum())
+        if tic:
+            sel_mz, sel_it = mz, inten
+            n_hit = int(len(mz))
+        else:
+            half = target_mz * tol * 1e-6 if tol_type == "ppm" else tol
+            mask = (mz >= target_mz - half) & (mz <= target_mz + half)
+            n_hit = int(mask.sum())
+            if n_hit == 0:
+                rows.append(dict(RT_min=rt_min, RT_sec=rt_sec, intensity_sum=0.0,
+                                 intensity_max=0.0, n_points=0,
+                                 nearest_mz=float("nan"), nearest_intensity=0.0))
+                continue
+            sel_mz, sel_it = mz[mask], inten[mask]
 
-        if n_hit == 0:
-            rows.append(dict(RT_min=rt_min, RT_sec=rt_sec, intensity_sum=0.0,
-                             intensity_max=0.0, n_points=0,
-                             nearest_mz=float("nan"), nearest_intensity=0.0))
-            continue
-
-        sel_mz, sel_it = mz[mask], inten[mask]
         k = int(np.argmax(sel_it))
-        value = float(sel_it.max()) if mode == "max" else float(sel_it.sum())
 
         rows.append(dict(RT_min=rt_min, RT_sec=rt_sec,
                          intensity_sum=float(sel_it.sum()),
@@ -279,14 +288,20 @@ def plot_overlay(traces, target_mz, tol, tol_type, out_png,
     x_unit = "min" if style.get("x_unit") is None else style.get("x_unit")
 
     y_name = style.get("y_name")
-    y_name = ("强度（窗口内累加）" if cn else "Intensity (sum in window)") \
-        if y_name is None else y_name
+    if y_name is None:
+        if style.get("kind") == "tic":
+            y_name = "总离子流强度" if cn else "Total ion current"
+        else:
+            y_name = "强度（窗口内累加）" if cn else "Intensity (sum in window)"
     y_unit = "" if style.get("y_unit") is None else style.get("y_unit")
 
     title = style.get("title")
     if title is None:
-        title = (f"m/z {target_mz} ±{tol} {tol_unit} 的提取离子色谱" if cn
-                 else f"XIC of m/z {target_mz} +/- {tol} {tol_unit}")
+        if style.get("kind") == "tic":
+            title = "总离子流色谱图 (TIC)" if cn else "Total Ion Chromatogram (TIC)"
+        else:
+            title = (f"m/z {target_mz} ±{tol} {tol_unit} 的提取离子色谱" if cn
+                     else f"XIC of m/z {target_mz} +/- {tol} {tol_unit}")
 
     ax.set_xlabel(_axis_label(x_name, x_unit))
     ax.set_ylabel(_axis_label(y_name, y_unit))
@@ -334,13 +349,14 @@ def process_one(path, args):
     hist = level_histogram(exp)
     ms_level, level_desc = resolve_ms_level(hist, args.ms_level)
 
+    tic = bool(getattr(args, "tic", False))
     rows = extract_trace(exp, args.mz, args.tol, args.tol_type,
-                         args.mode, ms_level, args.rt_range)
+                         args.mode, ms_level, args.rt_range, tic=tic)
 
     n = len(exp)
     info = dict(
         file=path, n_spectra=n, hist=hist, level_desc=level_desc,
-        rt_first=exp[0].getRT(), rt_last=exp[n - 1].getRT(),
+        rt_first=exp[0].getRT(), rt_last=exp[n - 1].getRT(), tic=tic,
     )
 
     if not rows:
@@ -357,7 +373,8 @@ def process_one(path, args):
                     apex_mz=apex["nearest_mz"], apex_n=apex["n_points"])
     else:
         info["apex_rt"] = None
-        info["diagnostic"] = diagnose(exp, args.mz)
+        if not tic:
+            info["diagnostic"] = diagnose(exp, args.mz)
     return rows, info
 
 
@@ -365,7 +382,10 @@ def main():
     ap = argparse.ArgumentParser(
         description="从 Thermo .raw 提取指定 m/z 的强度-时间曲线")
     ap.add_argument("inputs", nargs="+", help=".raw 文件、目录或通配符")
-    ap.add_argument("--mz", type=float, required=True, help="目标 m/z，如 58.83")
+    ap.add_argument("--mz", type=float, default=None,
+                    help="目标 m/z，如 58.83（用 --tic 时不需要）")
+    ap.add_argument("--tic", action="store_true",
+                    help="提取总离子流色谱图 TIC（每个时刻所有离子强度之和），不需要 --mz")
     ap.add_argument("--tol", type=float, default=0.01,
                     help="容差，默认 0.01（--tol-type ppm 时为 ppm 数）")
     ap.add_argument("--tol-type", choices=["da", "ppm"], default="da")
@@ -408,6 +428,12 @@ def main():
             return None
         return "" if v.strip().lower() in ("none", "null", "empty") else v
 
+    if not args.tic and args.mz is None:
+        print("[错误] 需要指定 --mz，或加 --tic 提取总离子流色谱图", file=sys.stderr)
+        return 2
+    if args.tic and args.mz is not None:
+        print("[提示] 已指定 --tic，--mz 将被忽略", file=sys.stderr)
+
     plot_style = {
         "title": blank_if_sentinel(args.title),
         "x_name": blank_if_sentinel(args.x_name),
@@ -416,6 +442,7 @@ def main():
         "y_unit": blank_if_sentinel(args.y_unit),
         "dpi": args.dpi,
         "names": curve_names,
+        "kind": "tic" if args.tic else "xic",
     }
 
     try:
@@ -446,20 +473,25 @@ def main():
             continue
 
         stem = os.path.splitext(os.path.basename(path))[0]
-        tag = f"{args.mz:g}".replace(".", "p")
-        csv_path = os.path.join(args.out, f"{stem}_xic_{tag}.csv")
+        tag = "tic" if args.tic else f"{args.mz:g}".replace(".", "p")
+        fname = f"{stem}_tic.csv" if args.tic else f"{stem}_xic_{tag}.csv"
+        csv_path = os.path.join(args.out, fname)
         write_csv(rows, csv_path)
         traces.append((path, rows))
         ok += 1
 
+        label = "总离子流" if args.tic else "窗口内"
         print(f"  谱图数 / 使用   : {info['n_spectra']} / {info['n_used']}  ({info['level_desc']})")
         print(f"  时间范围        : {info['rt_first']/60:.2f} ~ {info['rt_last']/60:.2f} min")
-        print(f"  窗口内有信号的谱: {info['n_signal']}")
+        print(f"  {label}有信号的谱: {info['n_signal']}")
 
         if info.get("apex_rt") is not None:
             print(f"  信号最强处      : RT={info['apex_rt']:.3f} min, 强度={info['apex_int']:.4g}")
-            print(f"                    该处峰 m/z={info['apex_mz']:.4f}，命中 {info['apex_n']} 个点")
-        else:
+            if args.tic:
+                print(f"                    该时刻基峰 m/z={info['apex_mz']:.4f}，共 {info['apex_n']} 个峰")
+            else:
+                print(f"                    该处峰 m/z={info['apex_mz']:.4f}，命中 {info['apex_n']} 个点")
+        elif not args.tic:
             print("  [警告] 该 m/z 窗口内整个色谱没有信号")
             diag = info.get("diagnostic")
             if diag:
@@ -469,10 +501,12 @@ def main():
         print(f"  → {csv_path}")
 
     if ok and not args.no_plot:
-        tag = f"{args.mz:g}".replace(".", "p")
-        png = os.path.join(args.out, f"XIC_{tag}_overlay.png")
+        tag = "tic" if args.tic else f"{args.mz:g}".replace(".", "p")
+        prefix = "TIC" if args.tic else "XIC"
+        png = os.path.join(args.out, f"{prefix}_{tag}_overlay.png")
         try:
-            plot_overlay(traces, args.mz, args.tol, args.tol_type, png,
+            plot_overlay(traces, args.mz if args.mz is not None else 0.0,
+                         args.tol, args.tol_type, png,
                          label_en=args.label_en, style=plot_style)
             print(f"\n曲线图 → {png}")
         except Exception as e:
