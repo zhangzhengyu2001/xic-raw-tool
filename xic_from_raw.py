@@ -256,6 +256,42 @@ def _label_for(path, names):
     return os.path.basename(path)
 
 
+def _range_for(path, ranges):
+    """找出这个文件单独指定的时间范围；没有则返回 None（表示用全局设置）。"""
+    if not ranges:
+        return None
+    stem = os.path.splitext(os.path.basename(path))[0]
+    for key in (path, os.path.abspath(path), os.path.basename(path), stem):
+        v = ranges.get(key)
+        if v:
+            return v
+    return None
+
+
+def parse_time_range(text):
+    """
+    把 "1,2" / "1-2" / "1~2" / "1" 解析成 (起, 止) 分钟。
+    只给一个数表示"从该时刻到结束"。解析失败返回 None。
+    """
+    s = (text or "").strip().replace("，", ",").replace("－", "-")
+    if not s:
+        return None
+    for sep in (",", "~", "—"):
+        if sep in s:
+            a, b = s.split(sep, 1)
+            try:
+                return (float(a), float(b))
+            except ValueError:
+                return None
+    m = re.match(r"^\s*([0-9.]+)\s*-\s*([0-9.]+)\s*$", s)
+    if m:
+        return (float(m.group(1)), float(m.group(2)))
+    try:
+        return (float(s), 1e9)
+    except ValueError:
+        return None
+
+
 def _axis_label(name, unit):
     name = (name or "").strip()
     unit = (unit or "").strip()
@@ -294,6 +330,7 @@ def plot_overlay(traces, target_mz, tol, tol_type, out_png,
 
     dpi = int(style.get("dpi") or 130)
     figsize = style.get("figsize") or (11, 5)
+    align_start = bool(style.get("align_start"))
 
     fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
     for path, rows in traces:
@@ -301,6 +338,9 @@ def plot_overlay(traces, target_mz, tol, tol_type, out_png,
             continue
         x = np.array([r["RT_min"] for r in rows])
         y = np.array([r["intensity_sum"] for r in rows])
+        if align_start and len(x):
+            # 每条曲线各自减去自己的首个时间点，使它们都从 0 开始
+            x = x - x[0]
         ax.plot(x, y, linewidth=1.0, label=_label_for(path, names))
 
     # 名称/单位：None 表示用默认，"" 表示留空
@@ -360,7 +400,8 @@ def collect_inputs(items):
     return [p for p in uniq if os.path.exists(p)]
 
 
-def process_one(path, args):
+def process_one(path, args, rt_range=None):
+    """rt_range 为 (起,止) 分钟；不给则用 args.rt_range（None 表示整条色谱）。"""
     readable, tmpdir = make_readable_path(path)
     try:
         exp = load_experiment(readable, centroid=args.centroid)
@@ -370,14 +411,16 @@ def process_one(path, args):
     hist = level_histogram(exp)
     ms_level, level_desc = resolve_ms_level(hist, args.ms_level)
 
+    limit = rt_range if rt_range is not None else getattr(args, "rt_range", None)
     tic = bool(getattr(args, "tic", False))
     rows = extract_trace(exp, args.mz, args.tol, args.tol_type,
-                         args.mode, ms_level, args.rt_range, tic=tic)
+                         args.mode, ms_level, limit, tic=tic)
 
     n = len(exp)
     info = dict(
         file=path, n_spectra=n, hist=hist, level_desc=level_desc,
         rt_first=exp[0].getRT(), rt_last=exp[n - 1].getRT(), tic=tic,
+        rt_limit=limit,
     )
 
     if not rows:
@@ -417,7 +460,12 @@ def main():
     ap.add_argument("--centroid", action="store_true",
                     help="让仪器端先做峰检测再取数（默认用采集到的原始点）")
     ap.add_argument("--rt-range", nargs=2, type=float, metavar=("MIN", "MIN"),
-                    help="只处理该保留时间区间（分钟）")
+                    help="所有文件共用同一段保留时间区间（分钟）")
+    ap.add_argument("--file-range", action="append", metavar="文件=起,止",
+                    help='给单个文件指定时间范围，可重复。例：--file-range "a.raw=1,2" '
+                         '--file-range "b.raw=3-4"。会覆盖 --rt-range')
+    ap.add_argument("--align-start", action="store_true",
+                    help="绘图时每条曲线各自减去自己的起始时间，让它们都从 0 开始")
     ap.add_argument("--out", default="xic_out", help="输出目录（默认 ./xic_out）")
     ap.add_argument("--no-plot", action="store_true")
     ap.add_argument("--label-en", action="store_true", help="图片标签用英文")
@@ -443,6 +491,19 @@ def main():
         k, v = item.split("=", 1)
         curve_names[k.strip()] = v.strip()
 
+    # 解析 --file-range 列表
+    file_ranges = {}
+    for item in (args.file_range or []):
+        if "=" not in item:
+            print(f"[警告] --file-range 需要「文件=起,止」格式，已忽略：{item}", file=sys.stderr)
+            continue
+        k, v = item.split("=", 1)
+        rng = parse_time_range(v)
+        if rng is None:
+            print(f"[警告] 时间范围无法解析，已忽略：{item}", file=sys.stderr)
+            continue
+        file_ranges[k.strip()] = rng
+
     # PowerShell 会把空字符串参数吞掉，所以用 none / null 表示"留空"
     def blank_if_sentinel(v):
         if v is None:
@@ -464,6 +525,7 @@ def main():
         "dpi": args.dpi,
         "names": curve_names,
         "kind": "tic" if args.tic else "xic",
+        "align_start": args.align_start,
     }
 
     try:
@@ -482,8 +544,9 @@ def main():
 
     for path in files:
         print(f"\n=== {os.path.basename(path)} ===")
+        limit = _range_for(path, file_ranges)
         try:
-            rows, info = process_one(path, args)
+            rows, info = process_one(path, args, rt_range=limit)
         except Exception as e:
             print(f"  [失败] {type(e).__name__}: {e}")
             continue
@@ -502,8 +565,11 @@ def main():
         ok += 1
 
         label = "总离子流" if args.tic else "窗口内"
+        used = info.get("rt_limit")
+        rng_txt = (f"{used[0]:.2f} ~ {used[1]:.2f} min" if used else "整个文件")
         print(f"  谱图数 / 使用   : {info['n_spectra']} / {info['n_used']}  ({info['level_desc']})")
-        print(f"  时间范围        : {info['rt_first']/60:.2f} ~ {info['rt_last']/60:.2f} min")
+        print(f"  取用时间段      : {rng_txt}")
+        print(f"  文件完整时间    : {info['rt_first']/60:.2f} ~ {info['rt_last']/60:.2f} min")
         print(f"  {label}有信号的谱: {info['n_signal']}")
 
         if info.get("apex_rt") is not None:

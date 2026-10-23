@@ -43,6 +43,10 @@ DEFAULTS = {
     "dpi": "130",
     # 曲线名称（文件名 -> 显示名）
     "curve_names": {},
+    # 每个文件单独的时间范围（文件名 -> [起, 止]，None 表示该端不限）
+    "file_ranges": {},
+    # 绘图时是否把各曲线对齐到各自起点
+    "align_start": False,
 }
 
 
@@ -66,8 +70,8 @@ def save_config(cfg):
 
 
 # ---------------------------------------------------------------- 核心执行
-def run_extraction(files, args, out_dir, log, style=None):
-    """跑完全部文件。返回 (png路径, 成功数, 失败列表, traces)"""
+def run_extraction(files, args, out_dir, log, style=None, ranges=None):
+    """跑完全部文件。ranges 为 {文件名: (起,止)}，覆盖 args.rt_range。"""
     os.makedirs(out_dir, exist_ok=True)
     tic = bool(getattr(args, "tic", False))
     tag = "tic" if tic else f"{args.mz:g}".replace(".", "p")
@@ -76,8 +80,9 @@ def run_extraction(files, args, out_dir, log, style=None):
 
     for p in files:
         log(f"=== {os.path.basename(p)} ===")
+        limit = core._range_for(p, ranges) or getattr(args, "rt_range", None)
         try:
-            rows, info = core.process_one(p, args)
+            rows, info = core.process_one(p, args, rt_range=limit)
         except Exception as e:
             failed.append((p, f"{type(e).__name__}: {e}"))
             log(f"  失败：{type(e).__name__}: {e}")
@@ -94,7 +99,9 @@ def run_extraction(files, args, out_dir, log, style=None):
         core.write_csv(rows, csv_path)
         traces.append((p, rows))
 
-        log(f"  谱图数 {info['n_used']}，时间 {info['rt_first']/60:.2f}~{info['rt_last']/60:.2f} min")
+        used = info.get("rt_limit")
+        rng_txt = f"{used[0]:g}~{used[1]:g} min" if used else "整个文件"
+        log(f"  谱图数 {info['n_used']}，取用 {rng_txt}")
         if info.get("apex_rt") is not None:
             log(f"  最强处 RT={info['apex_rt']:.3f} min，强度={info['apex_int']:.4g}")
         elif not tic:
@@ -137,19 +144,32 @@ def main():
 
     files = []                                      # 绝对路径列表
     name_map = dict(cfg.get("curve_names") or {})   # 文件名 -> 自定义名称
+    # 文件名 -> (起, 止) 分钟；None 表示该端不限。没有条目 = 用全局设置
+    range_map = {}
+    for k, v in (cfg.get("file_ranges") or {}).items():
+        try:
+            range_map[k] = (None if v[0] is None else float(v[0]),
+                            None if v[1] is None else float(v[1]))
+        except Exception:
+            continue
     log_q = queue.Queue()
     state = {"png": None, "photo": None, "traces": None, "args": None, "out": None}
 
     # ---------------- 1. 文件
-    frm_files = ttk.LabelFrame(root, text="1. 选择 .raw 文件（双击「曲线名称」可重命名）")
+    frm_files = ttk.LabelFrame(
+        root, text="1. 选择 .raw 文件（双击「曲线名称」改名；双击「起始/结束」设时间范围）")
     frm_files.pack(fill="x", padx=10, pady=(10, 6))
 
-    tree = ttk.Treeview(frm_files, columns=("file", "curve"),
+    tree = ttk.Treeview(frm_files, columns=("file", "curve", "t0", "t1"),
                         show="headings", height=4, selectmode="extended")
     tree.heading("file", text="文件")
     tree.heading("curve", text="曲线名称")
-    tree.column("file", width=420, anchor="w")
-    tree.column("curve", width=200, anchor="w")
+    tree.heading("t0", text="起始(min)")
+    tree.heading("t1", text="结束(min)")
+    tree.column("file", width=300, anchor="w")
+    tree.column("curve", width=150, anchor="w")
+    tree.column("t0", width=85, anchor="center")
+    tree.column("t1", width=85, anchor="center")
     tree.pack(side="left", fill="both", expand=True, padx=(10, 6), pady=8)
 
     tsb = ttk.Scrollbar(frm_files, orient="vertical", command=tree.yview)
@@ -163,10 +183,19 @@ def main():
         base = os.path.basename(path)
         return name_map.get(base) or os.path.splitext(base)[0]
 
+    def display_range(path):
+        rng = range_map.get(os.path.basename(path))
+        if not rng:
+            return ("", "")
+        a, b = rng
+        return ("" if a is None else f"{a:g}", "" if b is None else f"{b:g}")
+
     def refresh_tree():
         tree.delete(*tree.get_children())
         for p in files:
-            tree.insert("", "end", iid=p, values=(os.path.basename(p), display_name(p)))
+            t0, t1 = display_range(p)
+            tree.insert("", "end", iid=p,
+                        values=(os.path.basename(p), display_name(p), t0, t1))
 
     def add_paths(paths):
         added = 0
@@ -226,10 +255,108 @@ def main():
             name_map.pop(base, None)
         refresh_tree()
 
-    tree.bind("<Double-1>", rename_selected)
+    # ---------------- 每个文件单独设时间范围
+    def ask_range_dialog(initial_start="", initial_end=""):
+        """弹出小窗口，填起止分钟。返回 (起, 止) 或 None 表示取消。"""
+        dlg = tk.Toplevel(root)
+        dlg.title("设置时间范围")
+        dlg.transient(root)
+        dlg.resizable(False, False)
+
+        frm = ttk.Frame(dlg, padding=14)
+        frm.pack(fill="both", expand=True)
+
+        ttk.Label(frm, text="起始(min)：").grid(row=0, column=0, sticky="e", pady=4)
+        v0 = tk.StringVar(value=initial_start)
+        ttk.Entry(frm, textvariable=v0, width=12).grid(row=0, column=1, sticky="w")
+        ttk.Label(frm, text="结束(min)：").grid(row=1, column=0, sticky="e", pady=4)
+        v1 = tk.StringVar(value=initial_end)
+        ttk.Entry(frm, textvariable=v1, width=12).grid(row=1, column=1, sticky="w")
+        ttk.Label(frm, text="留空表示该端不限；两个都留空 = 取整个文件",
+                  foreground="#666").grid(row=2, column=0, columnspan=2, pady=(6, 0))
+
+        result = {"value": None}
+
+        def ok(_=None):
+            vals = []
+            for var in (v0, v1):
+                s = var.get().strip()
+                if not s:
+                    vals.append(None)
+                    continue
+                try:
+                    vals.append(float(s))
+                except ValueError:
+                    messagebox.showerror("格式不对", f"「{s}」不是数字，请填分钟数，例如 1.5")
+                    return
+            if vals[0] is not None and vals[1] is not None and vals[0] >= vals[1]:
+                messagebox.showerror("范围不对", "起始时间必须小于结束时间。")
+                return
+            result["value"] = tuple(vals)
+            dlg.destroy()
+
+        def cancel():
+            dlg.destroy()
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=3, column=0, columnspan=2, pady=(12, 0))
+        ttk.Button(btns, text="确定", width=10, command=ok).pack(side="left", padx=4)
+        ttk.Button(btns, text="清除", width=10,
+                   command=lambda: (v0.set(""), v1.set(""))).pack(side="left", padx=4)
+        ttk.Button(btns, text="取消", width=10, command=cancel).pack(side="left", padx=4)
+
+        dlg.bind("<Return>", ok)
+        dlg.bind("<Escape>", lambda e: cancel())
+        dlg.grab_set()
+        root.wait_window(dlg)
+        return result["value"]
+
+    def set_range_for_selected():
+        sel = tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先在列表里选中一行。")
+            return
+        path = sel[0]
+        base = os.path.basename(path)
+        cur = range_map.get(base)
+        got = ask_range_dialog(
+            "" if not cur or cur[0] is None else f"{cur[0]:g}",
+            "" if not cur or cur[1] is None else f"{cur[1]:g}")
+        if got is None:
+            return
+        if got[0] is None and got[1] is None:
+            range_map.pop(base, None)
+            log(f"{base}：恢复为使用全局时间设置")
+        else:
+            range_map[base] = got
+            a = "-∞" if got[0] is None else f"{got[0]:g}"
+            b = "+∞" if got[1] is None else f"{got[1]:g}"
+            log(f"{base}：时间范围 {a} ~ {b} min")
+            # 一旦用了单独的时间范围，通常就是想把不同时段的曲线叠在一起比
+            try:
+                align_var.set(True)
+            except Exception:
+                pass
+        refresh_tree()
+
+    def on_tree_double_click(event):
+        col = tree.identify_column(event.x)
+        row = tree.identify_row(event.y)
+        if not row:
+            return
+        tree.selection_set(row)
+        tree.focus(row)
+        if col == "#2":          # 曲线名称列
+            rename_selected()
+        else:                    # 其余列都打开时间范围设置
+            set_range_for_selected()
+
+    tree.bind("<Double-1>", on_tree_double_click)
 
     ttk.Button(frm_btns, text="选择文件…", width=12, command=pick_files).pack(pady=2)
     ttk.Button(frm_btns, text="选择文件夹…", width=12, command=pick_folder).pack(pady=2)
+    ttk.Button(frm_btns, text="设时间范围…", width=12,
+               command=set_range_for_selected).pack(pady=2)
     ttk.Button(frm_btns, text="重命名曲线", width=12, command=rename_selected).pack(pady=2)
     ttk.Button(frm_btns, text="移除选中", width=12, command=remove_sel).pack(pady=2)
     ttk.Button(frm_btns, text="清空", width=12, command=clear_all).pack(pady=2)
@@ -353,6 +480,13 @@ def main():
     ttk.Label(g, text="数值越大图片越清晰、文件越大",
               foreground="#666").grid(row=3, column=2, columnspan=3, sticky="w", pady=3)
 
+    align_var = tk.BooleanVar(value=cfg.get("align_start", False))
+    ttk.Checkbutton(g, text="各曲线对齐到各自起点（都从 0 开始画）",
+                    variable=align_var).grid(row=4, column=0, columnspan=2,
+                                             sticky="w", pady=(3, 1))
+    ttk.Label(g, text="配合各文件不同的时间范围使用",
+              foreground="#666").grid(row=4, column=2, columnspan=3, sticky="w", pady=(3, 1))
+
     toggle_title()
 
     # ---------------- 操作区
@@ -421,6 +555,7 @@ def main():
             "dpi": dpi,
             "names": {k: v for k, v in name_map.items() if v},
             "kind": "tic" if mode_var.get() == "tic" else "xic",
+            "align_start": align_var.get(),
         }
 
     def persist():
@@ -434,7 +569,9 @@ def main():
             "x_name": x_name_var.get(), "x_unit": x_unit_var.get(),
             "y_name": y_name_var.get(), "y_unit": y_unit_var.get(),
             "dpi": dpi_var.get(),
+            "align_start": align_var.get(),
             "curve_names": {k: v for k, v in name_map.items() if v},
+            "file_ranges": {k: list(v) for k, v in range_map.items()},
         })
 
     def show_preview(png):
@@ -591,7 +728,8 @@ def main():
         def worker():
             try:
                 png, ok, failed, traces = run_extraction(
-                    list(files), args, out_dir, log, style=style)
+                    list(files), args, out_dir, log, style=style,
+                    ranges=dict(range_map))
             except Exception:
                 log("未预期的错误：\n" + traceback.format_exc())
                 png, ok, failed, traces = None, 0, [], []
