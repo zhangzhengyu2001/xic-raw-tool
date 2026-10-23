@@ -125,6 +125,33 @@ def run_extraction(files, args, out_dir, log, style=None, ranges=None):
     return png, len(traces), failed, traces
 
 
+# ---------------------------------------------------------------- 输出目录
+def resolve_out_dir(field_value, last_out=None, default=None, create=True):
+    """
+    解析该用哪个输出目录。
+
+    优先级：界面输入框 > 上次运行实际用的目录 > 默认目录。
+    之所以要"输入框优先"，是因为用户可能刚改了输出目录、还没重新提取就要导出，
+    此时 last_out 还是旧的，不能拿它覆盖用户的选择。
+
+    返回规范化后的绝对路径；目录无法创建时返回 None。
+    """
+    cand = (field_value or "").strip()
+    if not cand:
+        cand = last_out or default or os.getcwd()
+    cand = os.path.normpath(os.path.expanduser(cand))
+
+    if os.path.isdir(cand):
+        return cand
+    if not create:
+        return cand
+    try:
+        os.makedirs(cand, exist_ok=True)
+    except Exception:
+        return None
+    return cand
+
+
 # ---------------------------------------------------------------- 界面
 def main():
     import tkinter as tk
@@ -499,8 +526,13 @@ def main():
     replot_btn.pack(side="left", padx=6)
     export_btn = ttk.Button(frm_act, text="导出图片…", width=12, state="disabled")
     export_btn.pack(side="left")
+    def open_out_dir():
+        folder = current_out_dir()
+        if folder:
+            os.startfile(folder)
+
     ttk.Button(frm_act, text="打开输出目录", width=13,
-               command=lambda: os.startfile(out_var.get().strip() or HERE)).pack(side="left", padx=6)
+               command=open_out_dir).pack(side="left", padx=6)
 
     status_var = tk.StringVar(value="就绪" if pyopenms_ok else "依赖缺失")
     ttk.Label(frm_act, textvariable=status_var, foreground="#0a5").pack(side="left", padx=10)
@@ -587,6 +619,16 @@ def main():
             img_label.configure(image="", text=f"预览加载失败：{e}\n图片位置：{png}")
 
     # ---------------- 重新生成图 / 导出
+    def current_out_dir(create=True):
+        """当前该使用的输出目录；目录不可用时弹错误并返回 None。"""
+        folder = resolve_out_dir(out_var.get(), state["out"], HERE, create=create)
+        if folder is None:
+            messagebox.showerror(
+                "输出目录不可用",
+                f"无法使用这个目录：\n{out_var.get().strip()}\n\n"
+                "请检查路径是否有拼写错误、是否打到了只读位置。")
+        return folder
+
     def title_based_name():
         """按当前标题推导 PNG 文件名；没有自定义标题时返回空串。"""
         text = "" if title_auto_var.get() else title_var.get()
@@ -601,8 +643,10 @@ def main():
         if not target:
             # 重新生成时也跟随标题改名，改完标题点一下就换名字
             base = title_based_name()
+            folder = current_out_dir()
+            if folder is None:
+                return
             if base:
-                folder = state["out"] or out_var.get().strip() or HERE
                 target = os.path.join(folder, base + ".png")
             else:
                 target = state["png"]
@@ -618,7 +662,7 @@ def main():
         show_preview(target)
         nb.select(tab_img)
         if not silent:
-            log(f"图片已更新 → {os.path.basename(target)}")
+            log(f"图片已保存 → {target}")
 
     def do_replot():
         persist()
@@ -629,6 +673,10 @@ def main():
             messagebox.showinfo("提示", "还没有提取结果，请先点「开始提取」。")
             return
         persist()
+        # 目标目录以输入框为准（用户可能刚改过还没重新提取）
+        folder = current_out_dir()
+        if folder is None:
+            return
         # 默认文件名优先用图片标题；标题为空或自动生成时退回按 m/z 命名
         title_text = "" if title_auto_var.get() else title_var.get()
         default_name = core.safe_filename(title_text)
@@ -640,10 +688,10 @@ def main():
                 default_name = f"XIC_{tag}"
         default_name += ".png"
         path = filedialog.asksaveasfilename(
-            title="导出图片",
+            title=f"导出图片（当前目录：{folder}）",
             defaultextension=".png",
             initialfile=default_name,
-            initialdir=state["out"] or out_var.get().strip() or HERE,
+            initialdir=folder,
             filetypes=[("PNG 图片", "*.png")])
         if path:
             replot(save_path=path)
@@ -666,7 +714,10 @@ def main():
             lines = "\n".join(f"· {os.path.basename(p)}：{r}" for p, r in failed[:8])
             messagebox.showwarning("部分失败", f"成功 {ok} 个，失败 {len(failed)} 个：\n\n{lines}")
         elif ok:
-            messagebox.showinfo("完成", f"已完成 {ok} 个文件。\n\n输出目录：\n{out_var.get().strip()}")
+            messagebox.showinfo(
+                "完成",
+                f"已完成 {ok} 个文件。\n\n实际写入目录：\n"
+                f"{state['out'] or out_var.get().strip()}")
 
     def start():
         if not pyopenms_ok:
