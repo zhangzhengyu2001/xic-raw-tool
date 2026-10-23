@@ -105,7 +105,9 @@ def run_extraction(files, args, out_dir, log, style=None):
 
     png = None
     if traces:
-        png = os.path.join(out_dir, f"{prefix}_{tag}_overlay.png")
+        base = core.safe_filename((style or {}).get("title"))
+        png = os.path.join(out_dir, f"{base}.png" if base
+                           else f"{prefix}_{tag}_overlay.png")
         try:
             core.plot_overlay(traces, args.mz if args.mz is not None else 0.0,
                               args.tol, args.tol_type, png, style=style)
@@ -448,12 +450,25 @@ def main():
             img_label.configure(image="", text=f"预览加载失败：{e}\n图片位置：{png}")
 
     # ---------------- 重新生成图 / 导出
+    def title_based_name():
+        """按当前标题推导 PNG 文件名；没有自定义标题时返回空串。"""
+        text = "" if title_auto_var.get() else title_var.get()
+        return core.safe_filename(text)
+
     def replot(save_path=None, silent=False):
         traces, args = state["traces"], state["args"]
         if not traces or not args:
             messagebox.showinfo("提示", "还没有提取结果，请先点「开始提取」。")
             return
-        target = save_path or state["png"]
+        target = save_path
+        if not target:
+            # 重新生成时也跟随标题改名，改完标题点一下就换名字
+            base = title_based_name()
+            if base:
+                folder = state["out"] or out_var.get().strip() or HERE
+                target = os.path.join(folder, base + ".png")
+            else:
+                target = state["png"]
         if not target:
             return
         try:
@@ -466,7 +481,7 @@ def main():
         show_preview(target)
         nb.select(tab_img)
         if not silent:
-            log(f"图片已更新 → {target}")
+            log(f"图片已更新 → {os.path.basename(target)}")
 
     def do_replot():
         persist()
@@ -477,11 +492,16 @@ def main():
             messagebox.showinfo("提示", "还没有提取结果，请先点「开始提取」。")
             return
         persist()
-        if getattr(state["args"], "tic", False):
-            default_name = "TIC.png"
-        else:
-            tag = f"{state['args'].mz:g}".replace(".", "p")
-            default_name = f"XIC_{tag}.png"
+        # 默认文件名优先用图片标题；标题为空或自动生成时退回按 m/z 命名
+        title_text = "" if title_auto_var.get() else title_var.get()
+        default_name = core.safe_filename(title_text)
+        if not default_name:
+            if getattr(state["args"], "tic", False):
+                default_name = "TIC"
+            else:
+                tag = f"{state['args'].mz:g}".replace(".", "p")
+                default_name = f"XIC_{tag}"
+        default_name += ".png"
         path = filedialog.asksaveasfilename(
             title="导出图片",
             defaultextension=".png",

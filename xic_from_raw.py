@@ -29,6 +29,7 @@ import csv
 import glob
 import importlib
 import os
+import re
 import shutil
 import sys
 import time
@@ -36,6 +37,26 @@ import time
 import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+
+_FILENAME_BAD = '<>:"/\\|?*'
+
+
+def safe_filename(name, fallback="figure", max_len=120):
+    """
+    把任意文本转成可安全用作文件名的字符串（Windows 规则）。
+
+    非法字符 <>:"/\\|?* 和控制字符替换为下划线，去掉结尾的空格与点，
+    超长部分截断。返回空串表示"没有可用名字"，由调用方决定回退。
+    """
+    s = (name or "").strip()
+    if not s:
+        return ""
+    s = "".join("_" if (ch in _FILENAME_BAD or ord(ch) < 32) else ch for ch in s)
+    s = re.sub(r"\s+", " ", s)
+    s = s.strip(" .")
+    if len(s) > max_len:
+        s = s[:max_len].rstrip(" .")
+    return s or fallback
 
 
 # ---------------------------------------------------------------- 依赖加载
@@ -503,7 +524,10 @@ def main():
     if ok and not args.no_plot:
         tag = "tic" if args.tic else f"{args.mz:g}".replace(".", "p")
         prefix = "TIC" if args.tic else "XIC"
-        png = os.path.join(args.out, f"{prefix}_{tag}_overlay.png")
+        # 用户指定了标题就用标题当文件名，否则用默认命名
+        base = safe_filename(plot_style.get("title"))
+        png = os.path.join(args.out, f"{base}.png" if base
+                           else f"{prefix}_{tag}_overlay.png")
         try:
             plot_overlay(traces, args.mz if args.mz is not None else 0.0,
                          args.tol, args.tol_type, png,
