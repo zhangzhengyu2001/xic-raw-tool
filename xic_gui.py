@@ -47,6 +47,8 @@ DEFAULTS = {
     "file_ranges": {},
     # 绘图时是否把各曲线对齐到各自起点
     "align_start": False,
+    # 峰值标记：none / max / min / both
+    "mark": "none",
 }
 
 
@@ -514,6 +516,24 @@ def main():
     ttk.Label(g, text="配合各文件不同的时间范围使用",
               foreground="#666").grid(row=4, column=2, columnspan=3, sticky="w", pady=(3, 1))
 
+    # 峰值标记（可选）
+    MARK_LABELS = {
+        "不标记": "none",
+        "标记最大值（峰值）": "max",
+        "标记最小值": "min",
+        "最大值和最小值都标": "both",
+    }
+    MARK_BY_CODE = {v: k for k, v in MARK_LABELS.items()}
+
+    ttk.Label(g, text="峰值标记：").grid(row=5, column=0, sticky="e", pady=3)
+    mark_var = tk.StringVar(value=MARK_BY_CODE.get(cfg.get("mark", "none"), "不标记"))
+    ttk.Combobox(g, textvariable=mark_var, values=list(MARK_LABELS.keys()),
+                 width=18, state="readonly").grid(
+        row=5, column=1, sticky="w", padx=(6, 0), pady=3)
+    ttk.Label(g, text="在图上标出极值点及数值、时间",
+              foreground="#666").grid(row=5, column=2, columnspan=3,
+                                      sticky="w", pady=3)
+
     toggle_title()
 
     # ---------------- 操作区
@@ -588,6 +608,7 @@ def main():
             "names": {k: v for k, v in name_map.items() if v},
             "kind": "tic" if mode_var.get() == "tic" else "xic",
             "align_start": align_var.get(),
+            "mark": MARK_LABELS.get(mark_var.get(), "none"),
         }
 
     def persist():
@@ -602,6 +623,7 @@ def main():
             "y_name": y_name_var.get(), "y_unit": y_unit_var.get(),
             "dpi": dpi_var.get(),
             "align_start": align_var.get(),
+            "mark": MARK_LABELS.get(mark_var.get(), "none"),
             "curve_names": {k: v for k, v in name_map.items() if v},
             "file_ranges": {k: list(v) for k, v in range_map.items()},
         })

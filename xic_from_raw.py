@@ -300,6 +300,18 @@ def _axis_label(name, unit):
     return name
 
 
+def _fmt_number(v):
+    """强度值格式化：十万级以内用千分位，更大的用科学计数，小的保留有效位。"""
+    av = abs(v)
+    if av >= 1e7:
+        return f"{v:.3g}"
+    if av >= 1e3:
+        return f"{v:,.0f}"
+    if av >= 1:
+        return f"{v:.4g}"
+    return f"{v:.3g}"
+
+
 def plot_overlay(traces, target_mz, tol, tol_type, out_png,
                  label_en=False, style=None):
     """
@@ -313,6 +325,8 @@ def plot_overlay(traces, target_mz, tol, tol_type, out_png,
         figsize  画布尺寸（默认 11×5 英寸）
         names    {路径或文件名: 曲线显示名}
         legend   是否显示图例（默认：多条曲线或有自定义名称时显示）
+        align_start  是否把各曲线平移到同一起点
+        mark     峰值标记：none / max / min / both
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -333,6 +347,7 @@ def plot_overlay(traces, target_mz, tol, tol_type, out_png,
     align_start = bool(style.get("align_start"))
 
     fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+    plotted = []
     for path, rows in traces:
         if not rows:
             continue
@@ -341,7 +356,41 @@ def plot_overlay(traces, target_mz, tol, tol_type, out_png,
         if align_start and len(x):
             # 每条曲线各自减去自己的首个时间点，使它们都从 0 开始
             x = x - x[0]
-        ax.plot(x, y, linewidth=1.0, label=_label_for(path, names))
+        line, = ax.plot(x, y, linewidth=1.0, label=_label_for(path, names))
+        plotted.append((line, x, y))
+
+    # ---- 峰值标记（可选）
+    mark = (style.get("mark") or "none").lower()
+    if mark in ("max", "min", "both"):
+        for i, (line, x, y) in enumerate(plotted):
+            if not len(x):
+                continue
+            color = line.get_color()
+            targets = []
+            if mark in ("max", "both"):
+                targets.append(("max", int(np.argmax(y))))
+            if mark in ("min", "both"):
+                targets.append(("min", int(np.argmin(y))))
+            for j, (kind, k) in enumerate(targets):
+                px, py = float(x[k]), float(y[k])
+                ax.plot([px], [py], marker="o", markersize=5,
+                        color=color, markeredgecolor="white",
+                        markeredgewidth=0.8, zorder=6, linestyle="none")
+                # 多条曲线时按序错开标注位置，减少重叠
+                dy = 12 + 14 * i + 12 * j
+                prefix = "max" if kind == "max" else "min"
+                ax.annotate(
+                    f"{prefix} {_fmt_number(py)} @ {px:.2f} min",
+                    xy=(px, py), xytext=(8, dy), textcoords="offset points",
+                    fontsize=7.5, color=color,
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white",
+                              ec=color, lw=0.6, alpha=0.85),
+                    arrowprops=dict(arrowstyle="-", color=color, lw=0.6,
+                                    shrinkA=0, shrinkB=2))
+        # 给顶部的标注留出空间，避免被画布边缘裁掉
+        lo, hi = ax.get_ylim()
+        if hi > lo:
+            ax.set_ylim(lo, hi + (hi - lo) * 0.14)
 
     # 名称/单位：None 表示用默认，"" 表示留空
     x_name = style.get("x_name")
@@ -478,6 +527,9 @@ def main():
     ap.add_argument("--y-name", default=None, help="Y 轴名称（默认：强度）")
     ap.add_argument("--y-unit", default=None, help="Y 轴单位（默认：空；写 none 表示不显示）")
     ap.add_argument("--dpi", type=int, default=130, help="图片分辨率，默认 130")
+    ap.add_argument("--mark", choices=["none", "max", "min", "both"], default="none",
+                    help="在图上标出每条曲线的峰值：max 最大值（默认）/ "
+                         "min 最小值 / both 两者 / none 不标")
     ap.add_argument("--name", action="append", metavar="文件=显示名",
                     help='自定义曲线名称，可重复。例：--name "100.raw=100 度"')
     args = ap.parse_args()
@@ -526,6 +578,7 @@ def main():
         "names": curve_names,
         "kind": "tic" if args.tic else "xic",
         "align_start": args.align_start,
+        "mark": args.mark,
     }
 
     try:
