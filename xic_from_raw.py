@@ -378,11 +378,18 @@ def plot_overlay(traces, target_mz, tol, tol_type, out_png,
                         markeredgewidth=0.8, zorder=6, linestyle="none")
                 # 多条曲线时按序错开标注位置，减少重叠
                 dy = 12 + 14 * i + 12 * j
+                # 靠近右边缘的点把标注翻到左边，避免被画布裁掉
+                span = float(x.max() - x.min()) or 1.0
+                rel = (px - float(x.min())) / span
+                if rel > 0.68:
+                    dx, ha = -8, "right"
+                else:
+                    dx, ha = 8, "left"
                 prefix = "max" if kind == "max" else "min"
                 ax.annotate(
                     f"{prefix} {_fmt_number(py)} @ {px:.2f} min",
-                    xy=(px, py), xytext=(8, dy), textcoords="offset points",
-                    fontsize=7.5, color=color,
+                    xy=(px, py), xytext=(dx, dy), textcoords="offset points",
+                    fontsize=7.5, color=color, ha=ha,
                     bbox=dict(boxstyle="round,pad=0.2", fc="white",
                               ec=color, lw=0.6, alpha=0.85),
                     arrowprops=dict(arrowstyle="-", color=color, lw=0.6,
