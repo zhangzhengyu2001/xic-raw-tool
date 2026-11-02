@@ -47,8 +47,10 @@ DEFAULTS = {
     "file_ranges": {},
     # 绘图时是否把各曲线对齐到各自起点
     "align_start": False,
-    # 峰值标记：none / max / min / both
+    # 峰值标记：none / max / min / both / mean
     "mark": "none",
+    # 每条曲线单独的标记方式（文件名 -> 代码），没有条目则跟随 mark
+    "curve_marks": {},
 }
 
 
@@ -161,6 +163,19 @@ def main():
 
     cfg = load_config()
 
+    # 标记方式：下拉框显示文本 <-> 内部代码
+    MARK_LABELS = {
+        "不标记": "none",
+        "标记最大值（峰值）": "max",
+        "标记最小值": "min",
+        "最大值和最小值都标": "both",
+        "标记均值线": "mean",
+    }
+    MARK_BY_CODE = {v: k for k, v in MARK_LABELS.items()}
+    # 文件列表里那一列显示的简短文字
+    MARK_TEXT = {"none": "", "max": "峰值", "min": "谷值",
+                 "both": "峰+谷", "mean": "均值"}
+
     root = tk.Tk()
     root.title("m/z 强度-时间曲线提取")
     root.minsize(780, 640)
@@ -181,24 +196,61 @@ def main():
                             None if v[1] is None else float(v[1]))
         except Exception:
             continue
+    # 文件名 -> 标记方式（none/max/min/both/mean），没有条目 = 跟随全局
+    mark_map = dict(cfg.get("curve_marks") or {})
     log_q = queue.Queue()
     state = {"png": None, "photo": None, "traces": None, "args": None, "out": None}
 
+    # ---------------- 可滚动主体
+    # 窗口高度不够时（小屏幕、系统缩放较大），整块内容可以在右侧滚动条里上下拖动
+    outer = ttk.Frame(root)
+    outer.pack(fill="both", expand=True)
+
+    canvas = tk.Canvas(outer, highlightthickness=0, borderwidth=0)
+    vbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=vbar.set)
+    vbar.pack(side="right", fill="y")
+    canvas.pack(side="left", fill="both", expand=True)
+
+    body = ttk.Frame(canvas)
+    body_window = canvas.create_window((0, 0), window=body, anchor="nw")
+
+    def sync_scrollregion(_=None):
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    def fit_body_width(event):
+        canvas.itemconfigure(body_window, width=event.width)
+
+    body.bind("<Configure>", sync_scrollregion)
+    canvas.bind("<Configure>", fit_body_width)
+
+    def on_mousewheel(event):
+        # 指针在能自己滚动的控件上时交给控件处理，避免抢走它的滚轮
+        under = root.winfo_containing(event.x_root, event.y_root)
+        for w in (under, getattr(under, "master", None)):
+            if isinstance(w, (tk.Text, tk.Listbox, ttk.Treeview)):
+                return
+        canvas.yview_scroll(int(-event.delta / 120), "units")
+
+    root.bind_all("<MouseWheel>", on_mousewheel)
+
     # ---------------- 1. 文件
     frm_files = ttk.LabelFrame(
-        root, text="1. 选择 .raw 文件（双击「曲线名称」改名；双击「起始/结束」设时间范围）")
+        body, text="1. 选择 .raw 文件（双击各列可改：曲线名称 / 起始·结束 / 标记方式）")
     frm_files.pack(fill="x", padx=10, pady=(10, 6))
 
-    tree = ttk.Treeview(frm_files, columns=("file", "curve", "t0", "t1"),
+    tree = ttk.Treeview(frm_files, columns=("file", "curve", "t0", "t1", "mark"),
                         show="headings", height=4, selectmode="extended")
     tree.heading("file", text="文件")
     tree.heading("curve", text="曲线名称")
     tree.heading("t0", text="起始(min)")
     tree.heading("t1", text="结束(min)")
-    tree.column("file", width=300, anchor="w")
-    tree.column("curve", width=150, anchor="w")
-    tree.column("t0", width=85, anchor="center")
-    tree.column("t1", width=85, anchor="center")
+    tree.heading("mark", text="标记")
+    tree.column("file", width=250, anchor="w")
+    tree.column("curve", width=140, anchor="w")
+    tree.column("t0", width=80, anchor="center")
+    tree.column("t1", width=80, anchor="center")
+    tree.column("mark", width=90, anchor="center")
     tree.pack(side="left", fill="both", expand=True, padx=(10, 6), pady=8)
 
     tsb = ttk.Scrollbar(frm_files, orient="vertical", command=tree.yview)
@@ -219,12 +271,16 @@ def main():
         a, b = rng
         return ("" if a is None else f"{a:g}", "" if b is None else f"{b:g}")
 
+    def display_mark(path):
+        return MARK_TEXT.get(mark_map.get(os.path.basename(path), ""), "")
+
     def refresh_tree():
         tree.delete(*tree.get_children())
         for p in files:
             t0, t1 = display_range(p)
             tree.insert("", "end", iid=p,
-                        values=(os.path.basename(p), display_name(p), t0, t1))
+                        values=(os.path.basename(p), display_name(p), t0, t1,
+                                display_mark(p)))
 
     def add_paths(paths):
         added = 0
@@ -368,6 +424,55 @@ def main():
                 pass
         refresh_tree()
 
+    # ---------------- 每条曲线单独设标记方式
+    def set_mark_for_selected():
+        sel = tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先在列表里选中一行。")
+            return
+        base = os.path.basename(sel[0])
+        cur = mark_map.get(base, "")
+
+        dlg = tk.Toplevel(root)
+        dlg.title("标记方式")
+        dlg.transient(root)
+        dlg.resizable(False, False)
+
+        frm = ttk.Frame(dlg, padding=14)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text=f"「{base}」显示哪种标记？",
+                  font=("", 9, "bold")).pack(anchor="w", pady=(0, 8))
+
+        choice = tk.StringVar(value=cur if cur else "__default__")
+        options = [("__default__", "跟随上面的「默认标记」设置")]
+        for text, code in MARK_LABELS.items():
+            options.append((code, text))
+        for code, text in options:
+            ttk.Radiobutton(frm, text=text, value=code,
+                            variable=choice).pack(anchor="w", pady=1)
+
+        btns = ttk.Frame(frm)
+        btns.pack(pady=(12, 0))
+
+        def ok(_=None):
+            v = choice.get()
+            if v == "__default__":
+                mark_map.pop(base, None)
+                log(f"{base}：标记方式跟随全局设置")
+            else:
+                mark_map[base] = v
+                log(f"{base}：标记方式 = {MARK_TEXT.get(v) or v}")
+            dlg.destroy()
+            refresh_tree()
+
+        ttk.Button(btns, text="确定", width=10, command=ok).pack(side="left", padx=4)
+        ttk.Button(btns, text="取消", width=10,
+                   command=dlg.destroy).pack(side="left", padx=4)
+        dlg.bind("<Return>", ok)
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        dlg.grab_set()
+        root.wait_window(dlg)
+
     def on_tree_double_click(event):
         col = tree.identify_column(event.x)
         row = tree.identify_row(event.y)
@@ -377,7 +482,9 @@ def main():
         tree.focus(row)
         if col == "#2":          # 曲线名称列
             rename_selected()
-        else:                    # 其余列都打开时间范围设置
+        elif col == "#5":        # 标记列
+            set_mark_for_selected()
+        else:                    # 文件 / 起始 / 结束 列 → 时间范围
             set_range_for_selected()
 
     tree.bind("<Double-1>", on_tree_double_click)
@@ -386,12 +493,14 @@ def main():
     ttk.Button(frm_btns, text="选择文件夹…", width=12, command=pick_folder).pack(pady=2)
     ttk.Button(frm_btns, text="设时间范围…", width=12,
                command=set_range_for_selected).pack(pady=2)
+    ttk.Button(frm_btns, text="设标记方式…", width=12,
+               command=set_mark_for_selected).pack(pady=2)
     ttk.Button(frm_btns, text="重命名曲线", width=12, command=rename_selected).pack(pady=2)
     ttk.Button(frm_btns, text="移除选中", width=12, command=remove_sel).pack(pady=2)
     ttk.Button(frm_btns, text="清空", width=12, command=clear_all).pack(pady=2)
 
     # ---------------- 2. 提取参数
-    frm_par = ttk.LabelFrame(root, text="2. 提取参数")
+    frm_par = ttk.LabelFrame(body, text="2. 提取参数")
     frm_par.pack(fill="x", padx=10, pady=6)
 
     row0 = ttk.Frame(frm_par)
@@ -464,7 +573,7 @@ def main():
     ttk.Button(row3, text="浏览…", width=8, command=pick_out).pack(side="left", padx=4)
 
     # ---------------- 3. 图片设置
-    frm_img = ttk.LabelFrame(root, text="3. 图片设置")
+    frm_img = ttk.LabelFrame(body, text="3. 图片设置")
     frm_img.pack(fill="x", padx=10, pady=6)
 
     g = ttk.Frame(frm_img)
@@ -516,28 +625,20 @@ def main():
     ttk.Label(g, text="配合各文件不同的时间范围使用",
               foreground="#666").grid(row=4, column=2, columnspan=3, sticky="w", pady=(3, 1))
 
-    # 峰值标记（可选）
-    MARK_LABELS = {
-        "不标记": "none",
-        "标记最大值（峰值）": "max",
-        "标记最小值": "min",
-        "最大值和最小值都标": "both",
-    }
-    MARK_BY_CODE = {v: k for k, v in MARK_LABELS.items()}
-
-    ttk.Label(g, text="峰值标记：").grid(row=5, column=0, sticky="e", pady=3)
+    # 峰值/均值标记（可选，全局默认；单条曲线可在文件列表里单独覆盖）
+    ttk.Label(g, text="默认标记：").grid(row=5, column=0, sticky="e", pady=3)
     mark_var = tk.StringVar(value=MARK_BY_CODE.get(cfg.get("mark", "none"), "不标记"))
     ttk.Combobox(g, textvariable=mark_var, values=list(MARK_LABELS.keys()),
                  width=18, state="readonly").grid(
         row=5, column=1, sticky="w", padx=(6, 0), pady=3)
-    ttk.Label(g, text="在图上标出极值点及数值、时间",
+    ttk.Label(g, text="单条曲线可在文件列表「标记」列里单独设置",
               foreground="#666").grid(row=5, column=2, columnspan=3,
                                       sticky="w", pady=3)
 
     toggle_title()
 
     # ---------------- 操作区
-    frm_act = ttk.Frame(root)
+    frm_act = ttk.Frame(body)
     frm_act.pack(fill="x", padx=10, pady=4)
 
     run_btn = ttk.Button(frm_act, text="开始提取", width=14)
@@ -558,8 +659,9 @@ def main():
     ttk.Label(frm_act, textvariable=status_var, foreground="#0a5").pack(side="left", padx=10)
 
     # ---------------- 日志 / 预览
-    nb = ttk.Notebook(root)
-    nb.pack(fill="both", expand=True, padx=10, pady=(6, 10))
+    nb = ttk.Notebook(body)
+    # 不随窗口拉伸：窗口变矮时让整页滚动，而不是把日志/预览区压扁
+    nb.pack(fill="x", expand=False, padx=10, pady=(6, 10))
 
     tab_log = ttk.Frame(nb)
     nb.add(tab_log, text="运行日志")
@@ -609,6 +711,7 @@ def main():
             "kind": "tic" if mode_var.get() == "tic" else "xic",
             "align_start": align_var.get(),
             "mark": MARK_LABELS.get(mark_var.get(), "none"),
+            "marks": dict(mark_map),
         }
 
     def persist():
@@ -624,6 +727,7 @@ def main():
             "dpi": dpi_var.get(),
             "align_start": align_var.get(),
             "mark": MARK_LABELS.get(mark_var.get(), "none"),
+            "curve_marks": dict(mark_map),
             "curve_names": {k: v for k, v in name_map.items() if v},
             "file_ranges": {k: list(v) for k, v in range_map.items()},
         })
@@ -820,12 +924,15 @@ def main():
         log("依赖加载失败：" + pyopenms_err)
         log("请确认 pkgs 文件夹与本脚本在同一目录。")
 
-    # 按内容自动定尺寸，并限制在屏幕可用范围内，避免按钮被裁掉
+    # 按内容自动定尺寸；超出屏幕可用高度时靠右侧滚动条上下拖动
     root.update_idletasks()
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-    w = min(max(root.winfo_reqwidth() + 16, 860), sw - 60)
-    h = min(max(root.winfo_reqheight() + 170, 860), 940)
+    w = min(max(body.winfo_reqwidth() + 46, 880), sw - 60)
+    need_h = body.winfo_reqheight() + 46
+    h = min(max(need_h, 660), min(940, int(sh * 0.92)))
     root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(20, (sh - h) // 4)}")
+    root.update_idletasks()
+    sync_scrollregion()
 
     root.mainloop()
 

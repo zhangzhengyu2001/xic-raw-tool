@@ -268,6 +268,21 @@ def _range_for(path, ranges):
     return None
 
 
+MARK_CHOICES = ("none", "max", "min", "both", "mean")
+
+
+def _mark_for(path, marks, default="none"):
+    """找出这条曲线该用哪种标记；没有单独设置就用全局默认。"""
+    if marks:
+        stem = os.path.splitext(os.path.basename(path))[0]
+        for key in (path, os.path.abspath(path), os.path.basename(path), stem):
+            v = marks.get(key)
+            if v:
+                v = str(v).lower()
+                return v if v in MARK_CHOICES else default
+    return default
+
+
 def parse_time_range(text):
     """
     把 "1,2" / "1-2" / "1~2" / "1" 解析成 (起, 止) 分钟。
@@ -357,47 +372,82 @@ def plot_overlay(traces, target_mz, tol, tol_type, out_png,
             # 每条曲线各自减去自己的首个时间点，使它们都从 0 开始
             x = x - x[0]
         line, = ax.plot(x, y, linewidth=1.0, label=_label_for(path, names))
-        plotted.append((line, x, y))
+        plotted.append((path, line, x, y))
 
-    # ---- 峰值标记（可选）
-    mark = (style.get("mark") or "none").lower()
-    if mark in ("max", "min", "both"):
-        for i, (line, x, y) in enumerate(plotted):
-            if not len(x):
-                continue
-            color = line.get_color()
-            targets = []
-            if mark in ("max", "both"):
-                targets.append(("max", int(np.argmax(y))))
-            if mark in ("min", "both"):
-                targets.append(("min", int(np.argmin(y))))
-            for j, (kind, k) in enumerate(targets):
-                px, py = float(x[k]), float(y[k])
-                ax.plot([px], [py], marker="o", markersize=5,
-                        color=color, markeredgecolor="white",
-                        markeredgewidth=0.8, zorder=6, linestyle="none")
-                # 多条曲线时按序错开标注位置，减少重叠
-                dy = 12 + 14 * i + 12 * j
-                # 靠近右边缘的点把标注翻到左边，避免被画布裁掉
-                span = float(x.max() - x.min()) or 1.0
-                rel = (px - float(x.min())) / span
-                if rel > 0.68:
-                    dx, ha = -8, "right"
-                else:
-                    dx, ha = 8, "left"
-                prefix = "max" if kind == "max" else "min"
-                ax.annotate(
-                    f"{prefix} {_fmt_number(py)} @ {px:.2f} min",
-                    xy=(px, py), xytext=(dx, dy), textcoords="offset points",
-                    fontsize=7.5, color=color, ha=ha,
-                    bbox=dict(boxstyle="round,pad=0.2", fc="white",
-                              ec=color, lw=0.6, alpha=0.85),
-                    arrowprops=dict(arrowstyle="-", color=color, lw=0.6,
-                                    shrinkA=0, shrinkB=2))
-        # 给顶部的标注留出空间，避免被画布边缘裁掉
+    # ---- 峰值 / 均值标记（可选，支持逐条曲线设置）
+    default_mark = (style.get("mark") or "none").lower()
+    per_curve_marks = style.get("marks") or {}
+    any_marked = False
+
+    for i, (path, line, x, y) in enumerate(plotted):
+        if not len(x) or not len(y):
+            continue
+        kind = _mark_for(path, per_curve_marks, default_mark)
+        if kind == "none":
+            continue
+        any_marked = True
+        color = line.get_color()
+        ymin, ymax = float(y.min()), float(y.max())
+        yspan = (ymax - ymin) or 1.0
+        xmin, xmax = float(x.min()), float(x.max())
+        xspan = (xmax - xmin) or 1.0
+
+        # 均值：画一条水平虚线并标注数值
+        if kind == "mean":
+            mval = float(np.mean(y))
+            ax.axhline(mval, color=color, linewidth=0.9, linestyle="--",
+                       alpha=0.85, zorder=5)
+            ax.annotate(
+                f"mean {_fmt_number(mval)}",
+                xy=(0.995, mval), xycoords=("axes fraction", "data"),
+                xytext=(0, 4 + 11 * i), textcoords="offset points",
+                fontsize=7.5, color=color, ha="right", va="bottom",
+                bbox=dict(boxstyle="round,pad=0.2", fc="white",
+                          ec=color, lw=0.6, alpha=0.85), zorder=7)
+            continue
+
+        targets = []
+        if kind in ("max", "both"):
+            targets.append(("max", int(np.argmax(y))))
+        if kind in ("min", "both"):
+            targets.append(("min", int(np.argmin(y))))
+
+        for j, (which, k) in enumerate(targets):
+            px, py = float(x[k]), float(y[k])
+            ax.plot([px], [py], marker="o", markersize=5,
+                    color=color, markeredgecolor="white",
+                    markeredgewidth=0.8, zorder=6, linestyle="none")
+
+            rel_x = (px - xmin) / xspan
+            rel_y = (py - ymin) / yspan
+
+            # 靠近右边缘 → 标注翻到左边
+            if rel_x > 0.68:
+                dx, ha = -8, "right"
+            else:
+                dx, ha = 8, "left"
+            # 靠近上边缘 → 标注放到点下方，避免顶出画布
+            if rel_y > 0.70:
+                dy, va = -(14 + 12 * j), "top"
+            else:
+                dy, va = 12 + 14 * i + 12 * j, "bottom"
+
+            prefix = "max" if which == "max" else "min"
+            ax.annotate(
+                f"{prefix} {_fmt_number(py)} @ {px:.2f} min",
+                xy=(px, py), xytext=(dx, dy), textcoords="offset points",
+                fontsize=7.5, color=color, ha=ha, va=va,
+                bbox=dict(boxstyle="round,pad=0.2", fc="white",
+                          ec=color, lw=0.6, alpha=0.85),
+                arrowprops=dict(arrowstyle="-", color=color, lw=0.6,
+                                shrinkA=0, shrinkB=2), zorder=7)
+
+    if any_marked:
+        # 上下各留一点空间，避免标注贴边
         lo, hi = ax.get_ylim()
         if hi > lo:
-            ax.set_ylim(lo, hi + (hi - lo) * 0.14)
+            pad = (hi - lo) * 0.10
+            ax.set_ylim(lo - pad, hi + pad)
 
     # 名称/单位：None 表示用默认，"" 表示留空
     x_name = style.get("x_name")
@@ -431,7 +481,8 @@ def plot_overlay(traces, target_mz, tol, tol_type, out_png,
     if show_legend and any(rows for _, rows in traces):
         ax.legend(fontsize=8)
     fig.tight_layout()
-    fig.savefig(out_png)
+    # bbox_inches="tight"：把标注、图例等都算进画布，避免任何元素被裁掉
+    fig.savefig(out_png, bbox_inches="tight", pad_inches=0.15)
     plt.close(fig)
 
 
@@ -534,9 +585,13 @@ def main():
     ap.add_argument("--y-name", default=None, help="Y 轴名称（默认：强度）")
     ap.add_argument("--y-unit", default=None, help="Y 轴单位（默认：空；写 none 表示不显示）")
     ap.add_argument("--dpi", type=int, default=130, help="图片分辨率，默认 130")
-    ap.add_argument("--mark", choices=["none", "max", "min", "both"], default="none",
-                    help="在图上标出每条曲线的峰值：max 最大值（默认）/ "
-                         "min 最小值 / both 两者 / none 不标")
+    ap.add_argument("--mark", choices=["none", "max", "min", "both", "mean"],
+                    default="none",
+                    help="默认标记方式：max 最大值（默认推荐）/ min 最小值 / "
+                         "both 两者 / mean 均值线 / none 不标")
+    ap.add_argument("--curve-mark", action="append", metavar="文件=标记",
+                    help='单独给某条曲线指定标记方式，取值同 --mark，可重复。'
+                         '例：--curve-mark "a.raw=mean" --curve-mark "b.raw=max"')
     ap.add_argument("--name", action="append", metavar="文件=显示名",
                     help='自定义曲线名称，可重复。例：--name "100.raw=100 度"')
     args = ap.parse_args()
@@ -563,6 +618,19 @@ def main():
             continue
         file_ranges[k.strip()] = rng
 
+    # 解析 --curve-mark 列表
+    curve_marks = {}
+    for item in (args.curve_mark or []):
+        if "=" not in item:
+            print(f"[警告] --curve-mark 需要「文件=标记」格式，已忽略：{item}", file=sys.stderr)
+            continue
+        k, v = item.split("=", 1)
+        v = v.strip().lower()
+        if v not in MARK_CHOICES:
+            print(f"[警告] 标记方式只能是 {MARK_CHOICES}，已忽略：{item}", file=sys.stderr)
+            continue
+        curve_marks[k.strip()] = v
+
     # PowerShell 会把空字符串参数吞掉，所以用 none / null 表示"留空"
     def blank_if_sentinel(v):
         if v is None:
@@ -586,6 +654,7 @@ def main():
         "kind": "tic" if args.tic else "xic",
         "align_start": args.align_start,
         "mark": args.mark,
+        "marks": curve_marks,
     }
 
     try:
