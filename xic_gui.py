@@ -21,6 +21,12 @@ if HERE not in sys.path:
 
 import xic_from_raw as core  # noqa: E402
 
+try:
+    from PIL import Image, ImageTk
+    _HAS_PIL = True
+except Exception:
+    _HAS_PIL = False
+
 CONFIG_PATH = os.path.join(HERE, "xic_gui_config.json")
 
 DEFAULTS = {
@@ -673,6 +679,25 @@ def main():
 
     tab_img = ttk.Frame(nb)
     nb.add(tab_img, text="曲线预览")
+
+    # 预览缩放工具条
+    bar = ttk.Frame(tab_img)
+    bar.pack(fill="x", padx=8, pady=(8, 2))
+
+    zoom_text = tk.StringVar(value="适应窗口")
+
+    ttk.Button(bar, text="－ 缩小", width=8,
+               command=lambda: zoom_by(1 / 1.25)).pack(side="left")
+    ttk.Button(bar, text="＋ 放大", width=8,
+               command=lambda: zoom_by(1.25)).pack(side="left", padx=4)
+    ttk.Button(bar, text="适应窗口", width=9,
+               command=lambda: set_zoom(None)).pack(side="left", padx=(8, 4))
+    ttk.Button(bar, text="原始大小", width=9,
+               command=lambda: set_zoom(1.0)).pack(side="left")
+    ttk.Label(bar, textvariable=zoom_text, foreground="#666").pack(side="left", padx=10)
+    ttk.Label(bar, text="（也可在图上滚动鼠标滚轮缩放）",
+              foreground="#999").pack(side="left")
+
     img_label = ttk.Label(tab_img, text="运行完成后在这里显示曲线", anchor="center")
     img_label.pack(fill="both", expand=True)
 
@@ -732,17 +757,78 @@ def main():
             "file_ranges": {k: list(v) for k, v in range_map.items()},
         })
 
-    def show_preview(png):
+    # ---------------- 预览缩放
+    def fit_scale():
+        im = state.get("pil")
+        if im is None:
+            return 1.0
+        lw = max(img_label.winfo_width() - 10, 120)
+        lh = max(img_label.winfo_height() - 10, 90)
+        return min(lw / im.width, lh / im.height, 1.0)
+
+    def render_preview():
+        im = state.get("pil")
+        if im is None:
+            return
+        if not _HAS_PIL:
+            img_label.configure(image="", text="当前环境缺少 Pillow，无法显示预览")
+            return
+        scale = fit_scale() if state.get("zoom") is None else state["zoom"]
+        scale = max(0.02, min(8.0, scale))
+        state["scale"] = scale
+        w = max(1, int(round(im.width * scale)))
+        h = max(1, int(round(im.height * scale)))
         try:
-            img = tk.PhotoImage(file=png)
-            w, h = img.width(), img.height()
-            factor = max(1, int(max(w / 840, h / 420) + 0.999))
-            if factor > 1:
-                img = img.subsample(factor, factor)
-            state["photo"] = img
-            img_label.configure(image=img, text="")
+            photo = ImageTk.PhotoImage(im.resize((w, h), Image.LANCZOS))
+        except Exception as e:
+            img_label.configure(image="", text=f"预览渲染失败：{e}")
+            return
+        state["photo"] = photo      # 必须保留引用，否则图片会被回收成空白
+        img_label.configure(image=photo, text="")
+        zoom_text.set("适应窗口" if state.get("zoom") is None
+                      else f"{int(scale * 100)}%")
+
+    def set_zoom(z):
+        state["zoom"] = z
+        render_preview()
+
+    def zoom_by(factor):
+        base = state.get("scale") or 1.0
+        set_zoom(max(0.05, min(8.0, base * factor)))
+
+    def show_preview(png):
+        state["path"] = png
+        if not _HAS_PIL:
+            img_label.configure(
+                image="", text=f"当前环境缺少 Pillow，无法显示预览。\n图片位置：{png}")
+            return
+        try:
+            im = Image.open(png)
+            im.load()
+            state["pil"] = im
         except Exception as e:
             img_label.configure(image="", text=f"预览加载失败：{e}\n图片位置：{png}")
+            return
+        state["zoom"] = None
+        render_preview()
+
+    _resize_job = {"id": None}
+
+    def on_preview_resize(event=None):
+        # 窗口尺寸变了：只在"适应窗口"模式下重新计算，且做防抖
+        if state.get("zoom") is not None:
+            return
+        if _resize_job["id"]:
+            root.after_cancel(_resize_job["id"])
+        _resize_job["id"] = root.after(150, render_preview)
+
+    img_label.bind("<Configure>", on_preview_resize)
+
+    def on_preview_wheel(event):
+        zoom_by(1.1 if event.delta > 0 else 1 / 1.1)
+        return "break"          # 阻止整页跟着滚动
+
+    img_label.bind("<MouseWheel>", on_preview_wheel)
 
     # ---------------- 重新生成图 / 导出
     def current_out_dir(create=True):

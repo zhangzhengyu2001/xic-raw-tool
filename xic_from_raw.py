@@ -434,7 +434,7 @@ def plot_overlay(traces, target_mz, tol, tol_type, out_png,
 
             prefix = "max" if which == "max" else "min"
             ax.annotate(
-                f"{prefix} {_fmt_number(py)} @ {px:.2f} min",
+                f"{prefix} {_fmt_number(py)}",
                 xy=(px, py), xytext=(dx, dy), textcoords="offset points",
                 fontsize=7.5, color=color, ha=ha, va=va,
                 bbox=dict(boxstyle="round,pad=0.2", fc="white",
