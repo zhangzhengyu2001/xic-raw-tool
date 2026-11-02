@@ -327,6 +327,111 @@ def _fmt_number(v):
     return f"{v:.3g}"
 
 
+def _text_box(xd, yd, w, h, dx, dy, ha, va):
+    """由锚点偏移和文本对齐方式推出标注框的屏幕坐标 (x0, y0, x1, y1)。"""
+    x0 = xd + dx if ha == "left" else xd + dx - w
+    y0 = yd + dy if va == "bottom" else yd + dy - h
+    return (x0, y0, x0 + w, y0 + h)
+
+
+def _boxes_overlap(box, boxes):
+    for b in boxes:
+        if not (box[2] < b[0] or box[0] > b[2] or box[3] < b[1] or box[1] > b[3]):
+            return True
+    return False
+
+
+def _place_marks(ax, fig, plotted, mark_jobs):
+    """
+    把 max / min / mean 的标注摆到不压曲线、也不互相重叠的位置。
+
+    做法：先渲染一次拿到真实的坐标变换，然后把所有曲线的数据点换算到屏幕坐标；
+    对每个标注枚举多个候选方向与距离，估算文本框占位，打分挑最优：
+    压到数据点扣分、与其他标注重叠重扣、超出坐标轴重扣。
+    """
+    fs = 7.5
+    try:
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        ax_bb = ax.get_window_extent(renderer)
+    except Exception:
+        renderer, ax_bb = None, None
+
+    ppd = fig.dpi / 72.0        # 每 point 多少像素
+
+    parts = []
+    for _p, _line, x, y in plotted:
+        if len(x):
+            parts.append(ax.transData.transform(np.column_stack([x, y])))
+    all_pts = np.vstack(parts) if parts else np.empty((0, 2))
+
+    occupied = []
+    candidates = []
+    for dist in (14, 28, 44, 64):
+        for ddx, ha in ((10, "left"), (-10, "right")):
+            for ddy, va in ((dist, "bottom"), (-dist, "top")):
+                candidates.append((ddx, ddy, ha, va))
+
+    def place(xd, yd, text, color, anchor_xy):
+        tw = (0.60 * fs * len(text) + 14) * ppd
+        th = (fs * 1.6 + 6) * ppd
+
+        best = None
+        for ddx, ddy, ha, va in candidates:
+            box = _text_box(xd, yd, tw, th, ddx * ppd, ddy * ppd, ha, va)
+            outside = 0
+            if ax_bb is not None:
+                outside = 0 if (box[0] >= ax_bb.x0 - 6 and box[2] <= ax_bb.x1 + 6
+                                and box[1] >= ax_bb.y0 - 6 and box[3] <= ax_bb.y1 + 6) else 1
+            hits = 0
+            if len(all_pts):
+                m = ((all_pts[:, 0] >= box[0]) & (all_pts[:, 0] <= box[2]) &
+                     (all_pts[:, 1] >= box[1]) & (all_pts[:, 1] <= box[3]))
+                hits = int(m.sum())
+            lab = 1 if _boxes_overlap(box, occupied) else 0
+            score = hits + lab * 40 + outside * 200
+            if best is None or score < best[0]:
+                best = (score, box, ddx, ddy, ha, va)
+            if score == 0:
+                break
+
+        _score, box, ddx, ddy, ha, va = best
+        occupied.append(box)
+        ax.annotate(
+            text, xy=anchor_xy, xytext=(ddx, ddy), textcoords="offset points",
+            fontsize=fs, color=color, ha=ha, va=va, annotation_clip=False,
+            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=color,
+                      lw=0.6, alpha=0.92),
+            arrowprops=dict(arrowstyle="-", color=color, lw=0.6,
+                            shrinkA=0, shrinkB=2),
+            zorder=7)
+
+    for _path, line, x, y, kind in mark_jobs:
+        color = line.get_color()
+
+        if kind == "mean":
+            mval = float(np.mean(y))
+            xr = float(x.max())
+            xd, yd = ax.transData.transform([(xr, mval)])[0]
+            place(xd, yd, f"mean {_fmt_number(mval)}", color, (xr, mval))
+            continue
+
+        targets = []
+        if kind in ("max", "both"):
+            targets.append(("max", int(np.argmax(y))))
+        if kind in ("min", "both"):
+            targets.append(("min", int(np.argmin(y))))
+
+        for which, k in targets:
+            px, py = float(x[k]), float(y[k])
+            ax.plot([px], [py], marker="o", markersize=5, color=color,
+                    markeredgecolor="white", markeredgewidth=0.8,
+                    zorder=6, linestyle="none")
+            xd, yd = ax.transData.transform([(px, py)])[0]
+            prefix = "max" if which == "max" else "min"
+            place(xd, yd, f"{prefix} {_fmt_number(py)}", color, (px, py))
+
+
 def plot_overlay(traces, target_mz, tol, tol_type, out_png,
                  label_en=False, style=None):
     """
@@ -375,75 +480,24 @@ def plot_overlay(traces, target_mz, tol, tol_type, out_png,
         plotted.append((path, line, x, y))
 
     # ---- 峰值 / 均值标记（可选，支持逐条曲线设置）
+    # 标注的实际摆放推迟到 tight_layout 之后，那时坐标才是最终值
     default_mark = (style.get("mark") or "none").lower()
     per_curve_marks = style.get("marks") or {}
-    any_marked = False
+    mark_jobs = []
 
-    for i, (path, line, x, y) in enumerate(plotted):
+    for path, line, x, y in plotted:
         if not len(x) or not len(y):
             continue
         kind = _mark_for(path, per_curve_marks, default_mark)
         if kind == "none":
             continue
-        any_marked = True
-        color = line.get_color()
-        ymin, ymax = float(y.min()), float(y.max())
-        yspan = (ymax - ymin) or 1.0
-        xmin, xmax = float(x.min()), float(x.max())
-        xspan = (xmax - xmin) or 1.0
-
-        # 均值：画一条水平虚线并标注数值
+        mark_jobs.append((path, line, x, y, kind))
         if kind == "mean":
-            mval = float(np.mean(y))
-            ax.axhline(mval, color=color, linewidth=0.9, linestyle="--",
-                       alpha=0.85, zorder=5)
-            ax.annotate(
-                f"mean {_fmt_number(mval)}",
-                xy=(0.995, mval), xycoords=("axes fraction", "data"),
-                xytext=(0, 4 + 11 * i), textcoords="offset points",
-                fontsize=7.5, color=color, ha="right", va="bottom",
-                bbox=dict(boxstyle="round,pad=0.2", fc="white",
-                          ec=color, lw=0.6, alpha=0.85), zorder=7)
-            continue
+            ax.axhline(float(np.mean(y)), color=line.get_color(), linewidth=0.9,
+                       linestyle="--", alpha=0.85, zorder=5)
 
-        targets = []
-        if kind in ("max", "both"):
-            targets.append(("max", int(np.argmax(y))))
-        if kind in ("min", "both"):
-            targets.append(("min", int(np.argmin(y))))
-
-        for j, (which, k) in enumerate(targets):
-            px, py = float(x[k]), float(y[k])
-            ax.plot([px], [py], marker="o", markersize=5,
-                    color=color, markeredgecolor="white",
-                    markeredgewidth=0.8, zorder=6, linestyle="none")
-
-            rel_x = (px - xmin) / xspan
-            rel_y = (py - ymin) / yspan
-
-            # 靠近右边缘 → 标注翻到左边
-            if rel_x > 0.68:
-                dx, ha = -8, "right"
-            else:
-                dx, ha = 8, "left"
-            # 靠近上边缘 → 标注放到点下方，避免顶出画布
-            if rel_y > 0.70:
-                dy, va = -(14 + 12 * j), "top"
-            else:
-                dy, va = 12 + 14 * i + 12 * j, "bottom"
-
-            prefix = "max" if which == "max" else "min"
-            ax.annotate(
-                f"{prefix} {_fmt_number(py)}",
-                xy=(px, py), xytext=(dx, dy), textcoords="offset points",
-                fontsize=7.5, color=color, ha=ha, va=va,
-                bbox=dict(boxstyle="round,pad=0.2", fc="white",
-                          ec=color, lw=0.6, alpha=0.85),
-                arrowprops=dict(arrowstyle="-", color=color, lw=0.6,
-                                shrinkA=0, shrinkB=2), zorder=7)
-
-    if any_marked:
-        # 上下各留一点空间，避免标注贴边
+    if mark_jobs:
+        # 上下留白，给标注腾出空间
         lo, hi = ax.get_ylim()
         if hi > lo:
             pad = (hi - lo) * 0.10
@@ -481,6 +535,11 @@ def plot_overlay(traces, target_mz, tol, tol_type, out_png,
     if show_legend and any(rows for _, rows in traces):
         ax.legend(fontsize=8)
     fig.tight_layout()
+
+    # 标注放在最后：此时坐标变换已是最终值，可以做像素级的避让
+    if mark_jobs:
+        _place_marks(ax, fig, plotted, mark_jobs)
+
     # bbox_inches="tight"：把标注、图例等都算进画布，避免任何元素被裁掉
     fig.savefig(out_png, bbox_inches="tight", pad_inches=0.15)
     plt.close(fig)
