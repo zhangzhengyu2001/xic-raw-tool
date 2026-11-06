@@ -543,25 +543,45 @@ def main():
 
     row1 = ttk.Frame(frm_par)
     row1.pack(fill="x", padx=10, pady=(2, 4))
-    ttk.Label(row1, text="目标 m/z：").pack(side="left")
-    mz_var = tk.StringVar(value=cfg["mz"])
-    mz_entry = ttk.Entry(row1, textvariable=mz_var, width=26)
-    mz_entry.pack(side="left")
-    ttk.Label(row1, text="（多个用逗号或空格分隔）",
-              foreground="#666").pack(side="left", padx=(6, 0))
-    tol_label = ttk.Label(row1, text="   容差：")
+
+    left = ttk.Frame(row1)
+    left.pack(side="left", anchor="n")
+    ttk.Label(left, text="目标 m/z（每行一个）：").pack(anchor="w")
+
+    mz_box = ttk.Frame(left)
+    mz_box.pack(anchor="w", pady=(2, 0))
+    mz_text = tk.Text(mz_box, width=16, height=4, wrap="none",
+                      font=("Consolas", 9))
+    mz_text.pack(side="left", fill="y")
+    mz_text.insert("1.0", str(cfg["mz"]))
+    mz_sb = ttk.Scrollbar(mz_box, orient="vertical", command=mz_text.yview)
+    mz_sb.pack(side="left", fill="y")
+    mz_text.configure(yscrollcommand=mz_sb.set)
+
+    right = ttk.Frame(row1)
+    right.pack(side="left", anchor="n", padx=(14, 0))
+
+    tol_row = ttk.Frame(right)
+    tol_row.pack(anchor="w")
+    tol_label = ttk.Label(tol_row, text="容差：")
     tol_label.pack(side="left")
     tol_var = tk.StringVar(value=cfg["tol"])
-    tol_entry = ttk.Entry(row1, textvariable=tol_var, width=8)
+    tol_entry = ttk.Entry(tol_row, textvariable=tol_var, width=8)
     tol_entry.pack(side="left")
     unit_var = tk.StringVar(value=cfg["tol_type"])
-    unit_box = ttk.Combobox(row1, textvariable=unit_var, values=["da", "ppm"],
+    unit_box = ttk.Combobox(tol_row, textvariable=unit_var, values=["da", "ppm"],
                             width=5, state="readonly")
     unit_box.pack(side="left", padx=(4, 0))
 
+    ttk.Label(right, text="一行一个 m/z，也可用逗号分隔",
+              foreground="#666").pack(anchor="w", pady=(6, 0))
+
+    def get_mz_text():
+        return mz_text.get("1.0", "end-1c")
+
     def toggle_mode(*_):
         st = "disabled" if mode_var.get() == "tic" else "normal"
-        for w in (mz_entry, tol_entry):
+        for w in (mz_text, tol_entry):
             w.configure(state=st)
         unit_box.configure(state="disabled" if st == "disabled" else "readonly")
 
@@ -788,7 +808,7 @@ def main():
     def persist():
         save_config({
             "extract_mode": mode_var.get(),
-            "mz": mz_var.get(), "tol": tol_var.get(), "tol_type": unit_var.get(),
+            "mz": get_mz_text(), "tol": tol_var.get(), "tol_type": unit_var.get(),
             "whole_file": whole_var.get(),
             "rt_start": rt_start_var.get(), "rt_end": rt_end_var.get(),
             "out": out_var.get().strip(),
@@ -990,11 +1010,11 @@ def main():
         mz_list = []
         if not is_tic:
             try:
-                mz_list = core.parse_mz_list(mz_var.get())
+                mz_list = core.parse_mz_list(get_mz_text())
             except ValueError as e:
                 messagebox.showerror(
                     "参数错误",
-                    f"{e}\n\n多个 m/z 请用逗号或空格分隔，例如：58.83, 60.02, 72.5")
+                    f"{e}\n\n目标 m/z 请一行填一个，例如：\n58.83\n60.02\n72.5")
                 return
             if not mz_list:
                 messagebox.showerror("参数错误", "请填写目标 m/z，例如 58.83")
