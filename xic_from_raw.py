@@ -283,6 +283,26 @@ def _mark_for(path, marks, default="none"):
     return default
 
 
+def parse_mz_list(text):
+    """
+    把 "58.83, 60.02" / "58.83 60.02" / "58.83;60.02" 解析成 [58.83, 60.02]。
+    空输入返回空列表；有无法识别的片段抛 ValueError。
+    """
+    if text is None:
+        return []
+    if isinstance(text, (list, tuple)):
+        return [float(v) for v in text]
+
+    parts = [p for p in re.split(r"[,;，；、\s]+", str(text).strip()) if p]
+    out = []
+    for p in parts:
+        try:
+            out.append(float(p))
+        except ValueError:
+            raise ValueError(f"无法识别的 m/z：{p}")
+    return out
+
+
 def parse_time_range(text):
     """
     把 "1,2" / "1-2" / "1~2" / "1" 解析成 (起, 止) 分钟。
@@ -471,8 +491,11 @@ def plot_overlay(traces, target_mz, tol, tol_type, out_png,
     as_seconds = x_time_unit not in ("min", "minute", "minutes", "分钟")
 
     fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+    # traces 元素为 (路径, m/z 或 None, 数据行)。同一文件可能有多个 m/z
+    n_mz = len({t[1] for t in traces if len(t) > 2 and t[1] is not None})
     plotted = []
-    for path, rows in traces:
+    for item in traces:
+        path, mz, rows = item if len(item) > 2 else (item[0], None, item[1])
         if not rows:
             continue
         x = np.array([r["RT_min"] for r in rows])
@@ -482,7 +505,10 @@ def plot_overlay(traces, target_mz, tol, tol_type, out_png,
             x = x - x[0]
         if as_seconds:
             x = x * 60.0
-        line, = ax.plot(x, y, linewidth=1.0, label=_label_for(path, names))
+        label = _label_for(path, names)
+        if mz is not None and n_mz > 1:
+            label = f"{label} · m/z {mz:g}"
+        line, = ax.plot(x, y, linewidth=1.0, label=label)
         plotted.append((path, line, x, y))
 
     # ---- 峰值 / 均值标记（可选，支持逐条曲线设置）
@@ -527,6 +553,8 @@ def plot_overlay(traces, target_mz, tol, tol_type, out_png,
     if title is None:
         if style.get("kind") == "tic":
             title = "总离子流色谱图 (TIC)" if cn else "Total Ion Chromatogram (TIC)"
+        elif n_mz > 1:
+            title = "多个 m/z 的提取离子色谱" if cn else "XIC of multiple m/z"
         else:
             title = (f"m/z {target_mz} ±{tol} {tol_unit} 的提取离子色谱" if cn
                      else f"XIC of m/z {target_mz} +/- {tol} {tol_unit}")
@@ -553,7 +581,7 @@ def plot_overlay(traces, target_mz, tol, tol_type, out_png,
     show_legend = style.get("legend")
     if show_legend is None:
         show_legend = len(traces) > 1 or bool(names)
-    if show_legend and any(rows for _, rows in traces):
+    if show_legend and any((t[2] if len(t) > 2 else t[1]) for t in traces):
         ax.legend(fontsize=8)
     fig.tight_layout()
 
@@ -633,8 +661,9 @@ def main():
     ap = argparse.ArgumentParser(
         description="从 Thermo .raw 提取指定 m/z 的强度-时间曲线")
     ap.add_argument("inputs", nargs="+", help=".raw 文件、目录或通配符")
-    ap.add_argument("--mz", type=float, default=None,
-                    help="目标 m/z，如 58.83（用 --tic 时不需要）")
+    ap.add_argument("--mz", default=None,
+                    help='目标 m/z，可一次给多个，用逗号或空格分隔：'
+                         '--mz "58.83, 60.02" （用 --tic 时不需要）')
     ap.add_argument("--tic", action="store_true",
                     help="提取总离子流色谱图 TIC（每个时刻所有离子强度之和），不需要 --mz")
     ap.add_argument("--tol", type=float, default=0.01,
@@ -720,11 +749,19 @@ def main():
             return None
         return "" if v.strip().lower() in ("none", "null", "empty") else v
 
-    if not args.tic and args.mz is None:
+    # 解析 --mz（允许一次给多个）
+    try:
+        mz_list = parse_mz_list(args.mz)
+    except ValueError as e:
+        print(f"[错误] {e}", file=sys.stderr)
+        return 2
+
+    if not args.tic and not mz_list:
         print("[错误] 需要指定 --mz，或加 --tic 提取总离子流色谱图", file=sys.stderr)
         return 2
-    if args.tic and args.mz is not None:
+    if args.tic and mz_list:
         print("[提示] 已指定 --tic，--mz 将被忽略", file=sys.stderr)
+        mz_list = []
 
     plot_style = {
         "title": blank_if_sentinel(args.title),
@@ -756,66 +793,78 @@ def main():
     traces, ok = [], 0
 
     for path in files:
-        print(f"\n=== {os.path.basename(path)} ===")
         limit = _range_for(path, file_ranges)
-        try:
-            rows, info = process_one(path, args, rt_range=limit)
-        except Exception as e:
-            print(f"  [失败] {type(e).__name__}: {e}")
-            continue
+        targets = [None] if args.tic else mz_list
 
-        if info.get("empty"):
-            print(f"  谱图数 {info['n_spectra']}，但没有符合 --ms-level {args.ms_level} 的谱")
-            print(f"  该文件的 ms level 分布：{info['hist']}")
-            continue
+        for mz in targets:
+            head = os.path.basename(path) + (f"  m/z {mz:g}" if mz is not None else "")
+            print(f"\n=== {head} ===")
+            if mz is not None:
+                args.mz = mz        # process_one 内部用 args.mz
+            try:
+                rows, info = process_one(path, args, rt_range=limit)
+            except Exception as e:
+                print(f"  [失败] {type(e).__name__}: {e}")
+                continue
 
-        stem = os.path.splitext(os.path.basename(path))[0]
-        tag = "tic" if args.tic else f"{args.mz:g}".replace(".", "p")
-        fname = f"{stem}_tic.csv" if args.tic else f"{stem}_xic_{tag}.csv"
-        csv_path = os.path.join(args.out, fname)
-        write_csv(rows, csv_path)
-        traces.append((path, rows))
-        ok += 1
+            if info.get("empty"):
+                print(f"  谱图数 {info['n_spectra']}，但没有符合 --ms-level {args.ms_level} 的谱")
+                print(f"  该文件的 ms level 分布：{info['hist']}")
+                continue
 
-        label = "总离子流" if args.tic else "窗口内"
-        used = info.get("rt_limit")
-        rng_txt = (f"{used[0]:.2f} ~ {used[1]:.2f} min" if used else "整个文件")
-        print(f"  谱图数 / 使用   : {info['n_spectra']} / {info['n_used']}  ({info['level_desc']})")
-        print(f"  取用时间段      : {rng_txt}")
-        print(f"  文件完整时间    : {info['rt_first']/60:.2f} ~ {info['rt_last']/60:.2f} min")
-        print(f"  {label}有信号的谱: {info['n_signal']}")
+            stem = os.path.splitext(os.path.basename(path))[0]
+            tag = "tic" if args.tic else f"{mz:g}".replace(".", "p")
+            fname = f"{stem}_tic.csv" if args.tic else f"{stem}_xic_{tag}.csv"
+            csv_path = os.path.join(args.out, fname)
+            write_csv(rows, csv_path)
+            traces.append((path, mz, rows))
+            ok += 1
 
-        if info.get("apex_rt") is not None:
-            print(f"  信号最强处      : RT={info['apex_rt']:.3f} min, 强度={info['apex_int']:.4g}")
-            if args.tic:
-                print(f"                    该时刻基峰 m/z={info['apex_mz']:.4f}，共 {info['apex_n']} 个峰")
-            else:
-                print(f"                    该处峰 m/z={info['apex_mz']:.4f}，命中 {info['apex_n']} 个点")
-        elif not args.tic:
-            print("  [警告] 该 m/z 窗口内整个色谱没有信号")
-            diag = info.get("diagnostic")
-            if diag:
-                print(f"  {args.mz}±0.5 附近实际存在的强峰：")
-                for m, i in diag:
-                    print(f"      m/z = {m:10.4f}   强度 = {i:.4g}")
-        print(f"  → {csv_path}")
+            label = "总离子流" if args.tic else "窗口内"
+            used = info.get("rt_limit")
+            rng_txt = (f"{used[0]:.2f} ~ {used[1]:.2f} min" if used else "整个文件")
+            print(f"  谱图数 / 使用   : {info['n_spectra']} / {info['n_used']}  ({info['level_desc']})")
+            print(f"  取用时间段      : {rng_txt}")
+            print(f"  文件完整时间    : {info['rt_first']/60:.2f} ~ {info['rt_last']/60:.2f} min")
+            print(f"  {label}有信号的谱: {info['n_signal']}")
+
+            if info.get("apex_rt") is not None:
+                print(f"  信号最强处      : RT={info['apex_rt']:.3f} min, 强度={info['apex_int']:.4g}")
+                if args.tic:
+                    print(f"                    该时刻基峰 m/z={info['apex_mz']:.4f}，共 {info['apex_n']} 个峰")
+                else:
+                    print(f"                    该处峰 m/z={info['apex_mz']:.4f}，命中 {info['apex_n']} 个点")
+            elif not args.tic:
+                print("  [警告] 该 m/z 窗口内整个色谱没有信号")
+                diag = info.get("diagnostic")
+                if diag:
+                    print(f"  {mz}±0.5 附近实际存在的强峰：")
+                    for m, i in diag:
+                        print(f"      m/z = {m:10.4f}   强度 = {i:.4g}")
+            print(f"  → {csv_path}")
 
     if ok and not args.no_plot:
-        tag = "tic" if args.tic else f"{args.mz:g}".replace(".", "p")
-        prefix = "TIC" if args.tic else "XIC"
+        if args.tic:
+            tag, prefix = "tic", "TIC"
+        elif len(mz_list) > 1:
+            tag, prefix = "multi", "XIC"
+        else:
+            tag = f"{mz_list[0]:g}".replace(".", "p")
+            prefix = "XIC"
         # 用户指定了标题就用标题当文件名，否则用默认命名
         base = safe_filename(plot_style.get("title"))
         png = os.path.join(args.out, f"{base}.png" if base
                            else f"{prefix}_{tag}_overlay.png")
         try:
-            plot_overlay(traces, args.mz if args.mz is not None else 0.0,
+            plot_overlay(traces, mz_list[0] if len(mz_list) == 1 else 0.0,
                          args.tol, args.tol_type, png,
                          label_en=args.label_en, style=plot_style)
             print(f"\n曲线图 → {png}")
         except Exception as e:
             print(f"\n[警告] 画图失败（CSV 已正常输出）：{e}")
 
-    print(f"\n完成：{ok}/{len(files)} 个文件，输出目录 {os.path.abspath(args.out)}")
+    total = ok
+    print(f"\n完成：{total} 条曲线 / {len(files)} 个文件，输出目录 {os.path.abspath(args.out)}")
     return 0 if ok else 1
 
 

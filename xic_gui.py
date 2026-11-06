@@ -82,45 +82,65 @@ def save_config(cfg):
 
 
 # ---------------------------------------------------------------- 核心执行
-def run_extraction(files, args, out_dir, log, style=None, ranges=None):
-    """跑完全部文件。ranges 为 {文件名: (起,止)}，覆盖 args.rt_range。"""
+def run_extraction(files, args, out_dir, log, style=None, ranges=None, mz_list=None):
+    """跑完全部文件。ranges 为 {文件名: (起,止)}，覆盖 args.rt_range。
+    mz_list 为要提取的 m/z 列表（TIC 模式忽略）。"""
     os.makedirs(out_dir, exist_ok=True)
     tic = bool(getattr(args, "tic", False))
-    tag = "tic" if tic else f"{args.mz:g}".replace(".", "p")
-    prefix = "TIC" if tic else "XIC"
+    if tic:
+        targets = [None]
+    else:
+        targets = list(mz_list) if mz_list else [getattr(args, "mz", None)]
+        targets = [m for m in targets if m is not None]
+
+    if tic:
+        tag, prefix = "tic", "TIC"
+    elif len(targets) > 1:
+        tag, prefix = "multi", "XIC"
+    else:
+        tag = f"{targets[0]:g}".replace(".", "p") if targets else "xic"
+        prefix = "XIC"
+
     traces, failed = [], []
 
     for p in files:
-        log(f"=== {os.path.basename(p)} ===")
         limit = core._range_for(p, ranges) or getattr(args, "rt_range", None)
-        try:
-            rows, info = core.process_one(p, args, rt_range=limit)
-        except Exception as e:
-            failed.append((p, f"{type(e).__name__}: {e}"))
-            log(f"  失败：{type(e).__name__}: {e}")
-            continue
+        for mz in targets:
+            head = os.path.basename(p) + (f"  m/z {mz:g}" if mz is not None else "")
+            log(f"=== {head} ===")
+            if mz is not None:
+                args.mz = mz
+            try:
+                rows, info = core.process_one(p, args, rt_range=limit)
+            except Exception as e:
+                failed.append((p, f"{type(e).__name__}: {e}"))
+                log(f"  失败：{type(e).__name__}: {e}")
+                continue
 
-        if info.get("empty"):
-            failed.append((p, f"没有符合 ms level 的谱（分布 {info['hist']}）"))
-            log(f"  跳过：该文件没有符合 ms level 的谱，分布 {info['hist']}")
-            continue
+            if info.get("empty"):
+                failed.append((p, f"没有符合 ms level 的谱（分布 {info['hist']}）"))
+                log(f"  跳过：该文件没有符合 ms level 的谱，分布 {info['hist']}")
+                continue
 
-        fname = (f"{os.path.splitext(os.path.basename(p))[0]}_tic.csv" if tic
-                 else f"{os.path.splitext(os.path.basename(p))[0]}_xic_{tag}.csv")
-        csv_path = os.path.join(out_dir, fname)
-        core.write_csv(rows, csv_path)
-        traces.append((p, rows))
+            stem = os.path.splitext(os.path.basename(p))[0]
+            if tic:
+                fname = f"{stem}_tic.csv"
+            else:
+                fname = f"{stem}_xic_{mz:g}".replace(".", "p") + ".csv"
+            csv_path = os.path.join(out_dir, fname)
+            core.write_csv(rows, csv_path)
+            traces.append((p, mz, rows))
 
-        used = info.get("rt_limit")
-        rng_txt = f"{used[0]:g}~{used[1]:g} min" if used else "整个文件"
-        log(f"  谱图数 {info['n_used']}，取用 {rng_txt}")
-        if info.get("apex_rt") is not None:
-            log(f"  最强处 RT={info['apex_rt']:.3f} min，强度={info['apex_int']:.4g}")
-        elif not tic:
-            log("  警告：该 m/z 窗口内没有信号")
-            for m, i in (info.get("diagnostic") or [])[:5]:
-                log(f"      附近有峰 m/z={m:.4f} 强度={i:.4g}")
-        log(f"  → {os.path.basename(csv_path)}")
+            used = info.get("rt_limit")
+            rng_txt = f"{used[0]:g}~{used[1]:g} min" if used else "整个文件"
+            log(f"  谱图数 {info['n_used']}，取用 {rng_txt}")
+            if info.get("apex_rt") is not None:
+                log(f"  最强处 RT={info['apex_rt']:.3f} min，强度={info['apex_int']:.4g}")
+            elif not tic:
+                log("  警告：该 m/z 窗口内没有信号")
+                for m, i in (info.get("diagnostic") or [])[:5]:
+                    log(f"      附近有峰 m/z={m:.4f} 强度={i:.4g}")
+            log(f"  → {os.path.basename(csv_path)}")
 
     png = None
     if traces:
@@ -128,8 +148,9 @@ def run_extraction(files, args, out_dir, log, style=None, ranges=None):
         png = os.path.join(out_dir, f"{base}.png" if base
                            else f"{prefix}_{tag}_overlay.png")
         try:
-            core.plot_overlay(traces, args.mz if args.mz is not None else 0.0,
-                              args.tol, args.tol_type, png, style=style)
+            only_mz = targets[0] if (not tic and len(targets) == 1) else 0.0
+            core.plot_overlay(traces, only_mz, args.tol, args.tol_type, png,
+                              style=style)
         except Exception as e:
             log(f"  画图失败：{e}")
             png = None
@@ -524,9 +545,11 @@ def main():
     row1.pack(fill="x", padx=10, pady=(2, 4))
     ttk.Label(row1, text="目标 m/z：").pack(side="left")
     mz_var = tk.StringVar(value=cfg["mz"])
-    mz_entry = ttk.Entry(row1, textvariable=mz_var, width=12)
+    mz_entry = ttk.Entry(row1, textvariable=mz_var, width=26)
     mz_entry.pack(side="left")
-    tol_label = ttk.Label(row1, text="    容差：")
+    ttk.Label(row1, text="（多个用逗号或空格分隔）",
+              foreground="#666").pack(side="left", padx=(6, 0))
+    tol_label = ttk.Label(row1, text="   容差：")
     tol_label.pack(side="left")
     tol_var = tk.StringVar(value=cfg["tol"])
     tol_entry = ttk.Entry(row1, textvariable=tol_var, width=8)
@@ -964,13 +987,19 @@ def main():
             return
         is_tic = mode_var.get() == "tic"
 
-        mz = None
+        mz_list = []
         if not is_tic:
             try:
-                mz = float(mz_var.get())
-            except ValueError:
-                messagebox.showerror("参数错误", "目标 m/z 必须是数字，例如 58.83")
+                mz_list = core.parse_mz_list(mz_var.get())
+            except ValueError as e:
+                messagebox.showerror(
+                    "参数错误",
+                    f"{e}\n\n多个 m/z 请用逗号或空格分隔，例如：58.83, 60.02, 72.5")
                 return
+            if not mz_list:
+                messagebox.showerror("参数错误", "请填写目标 m/z，例如 58.83")
+                return
+        mz = mz_list[0] if mz_list else None
         try:
             tol = float(tol_var.get() or 0.01)
         except ValueError:
@@ -1016,7 +1045,7 @@ def main():
             try:
                 png, ok, failed, traces = run_extraction(
                     list(files), args, out_dir, log, style=style,
-                    ranges=dict(range_map))
+                    ranges=dict(range_map), mz_list=mz_list)
             except Exception:
                 log("未预期的错误：\n" + traceback.format_exc())
                 png, ok, failed, traces = None, 0, [], []
@@ -1057,7 +1086,8 @@ def selftest():
     style = {"title": "自检标题", "x_name": "Time", "x_unit": "min",
              "y_name": "Intensity", "y_unit": "a.u.", "dpi": 150, "names": {}}
     png, ok, failed, traces = run_extraction(
-        files, args, os.path.join(HERE, "selftest_out"), print, style=style)
+        files, args, os.path.join(HERE, "selftest_out"), print, style=style,
+        mz_list=[58.83, 60.02])
     print(f"\n成功 {ok}，失败 {len(failed)}，图片 {png}")
     return 0 if ok else 1
 
