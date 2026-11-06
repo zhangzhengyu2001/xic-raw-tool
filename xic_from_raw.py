@@ -466,6 +466,10 @@ def plot_overlay(traces, target_mz, tol, tol_type, out_png,
     figsize = style.get("figsize") or (11, 5)
     align_start = bool(style.get("align_start"))
 
+    # 时间轴单位：分钟或秒。秒模式下刻度细化到 0.5
+    x_time_unit = str(style.get("x_time_unit") or "min").lower()
+    as_seconds = x_time_unit not in ("min", "minute", "minutes", "分钟")
+
     fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
     plotted = []
     for path, rows in traces:
@@ -476,6 +480,8 @@ def plot_overlay(traces, target_mz, tol, tol_type, out_png,
         if align_start and len(x):
             # 每条曲线各自减去自己的首个时间点，使它们都从 0 开始
             x = x - x[0]
+        if as_seconds:
+            x = x * 60.0
         line, = ax.plot(x, y, linewidth=1.0, label=_label_for(path, names))
         plotted.append((path, line, x, y))
 
@@ -506,7 +512,8 @@ def plot_overlay(traces, target_mz, tol, tol_type, out_png,
     # 名称/单位：None 表示用默认，"" 表示留空
     x_name = style.get("x_name")
     x_name = ("保留时间" if cn else "Retention time") if x_name is None else x_name
-    x_unit = "min" if style.get("x_unit") is None else style.get("x_unit")
+    x_unit = ("s" if as_seconds else "min") if style.get("x_unit") is None \
+        else style.get("x_unit")
 
     y_name = style.get("y_name")
     if y_name is None:
@@ -529,6 +536,20 @@ def plot_overlay(traces, target_mz, tol, tol_type, out_png,
     ax.set_title(title)
 
     ax.grid(alpha=0.3)
+
+    # 秒模式：刻度标签保留一位小数，时间范围较短时再补 0.5 秒的次刻度
+    if as_seconds:
+        from matplotlib.ticker import FormatStrFormatter, MaxNLocator, MultipleLocator
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=10, steps=[1, 2, 2.5, 5, 10]))
+        ax.xaxis.set_major_formatter(FormatStrFormatter("%.1f"))
+
+        xs = [c[2] for c in plotted if len(c[2])]
+        if xs:
+            span = float(np.ptp(np.concatenate(xs)))
+            if 0 < span <= 30:
+                ax.xaxis.set_minor_locator(MultipleLocator(0.5))
+                ax.grid(which="minor", alpha=0.15, linewidth=0.6)
+
     show_legend = style.get("legend")
     if show_legend is None:
         show_legend = len(traces) > 1 or bool(names)
@@ -641,6 +662,9 @@ def main():
                     help='图标题；写 none 表示不要标题（PowerShell 里 "" 会被吞掉）')
     ap.add_argument("--x-name", default=None, help="X 轴名称（默认：保留时间）")
     ap.add_argument("--x-unit", default=None, help="X 轴单位（默认：min；写 none 表示不显示）")
+    ap.add_argument("--x-time-unit", choices=["min", "s"], default="min",
+                    help="时间轴用分钟还是秒（默认 min）。秒模式下刻度保留一位小数，"
+                         "时间范围短时补 0.5 秒次刻度")
     ap.add_argument("--y-name", default=None, help="Y 轴名称（默认：强度）")
     ap.add_argument("--y-unit", default=None, help="Y 轴单位（默认：空；写 none 表示不显示）")
     ap.add_argument("--dpi", type=int, default=130, help="图片分辨率，默认 130")
@@ -714,6 +738,7 @@ def main():
         "align_start": args.align_start,
         "mark": args.mark,
         "marks": curve_marks,
+        "x_time_unit": args.x_time_unit,
     }
 
     try:

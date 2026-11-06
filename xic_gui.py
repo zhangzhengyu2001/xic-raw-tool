@@ -47,6 +47,8 @@ DEFAULTS = {
     "y_name": "强度",
     "y_unit": "",
     "dpi": "130",
+    # 时间轴单位：min 或 s
+    "x_time_unit": "min",
     # 曲线名称（文件名 -> 显示名）
     "curve_names": {},
     # 每个文件单独的时间范围（文件名 -> [起, 止]，None 表示该端不限）
@@ -641,6 +643,26 @@ def main():
               foreground="#666").grid(row=5, column=2, columnspan=3,
                                       sticky="w", pady=3)
 
+    # 时间轴单位：分钟 / 秒
+    ttk.Label(g, text="时间轴单位：").grid(row=6, column=0, sticky="e", pady=3)
+    time_unit_var = tk.StringVar(
+        value="秒" if str(cfg.get("x_time_unit", "min")).lower() in ("s", "秒") else "分钟")
+
+    def on_time_unit_change(*_):
+        want = "s" if time_unit_var.get() == "秒" else "min"
+        cur = x_unit_var.get().strip().lower()
+        # 只在用户没手动改成别的单位时跟着切换
+        if cur in ("min", "s", ""):
+            x_unit_var.set(want)
+
+    ttk.Combobox(g, textvariable=time_unit_var, values=["分钟", "秒"],
+                 width=8, state="readonly").grid(
+        row=6, column=1, sticky="w", padx=(6, 0), pady=3)
+    time_unit_var.trace_add("write", on_time_unit_change)
+    ttk.Label(g, text="选「秒」时刻度保留一位小数，并补 0.5 秒次刻度",
+              foreground="#666").grid(row=6, column=2, columnspan=3,
+                                      sticky="w", pady=3)
+
     toggle_title()
 
     # ---------------- 操作区
@@ -737,6 +759,7 @@ def main():
             "align_start": align_var.get(),
             "mark": MARK_LABELS.get(mark_var.get(), "none"),
             "marks": dict(mark_map),
+            "x_time_unit": "s" if time_unit_var.get() == "秒" else "min",
         }
 
     def persist():
@@ -750,6 +773,7 @@ def main():
             "x_name": x_name_var.get(), "x_unit": x_unit_var.get(),
             "y_name": y_name_var.get(), "y_unit": y_unit_var.get(),
             "dpi": dpi_var.get(),
+            "x_time_unit": "s" if time_unit_var.get() == "秒" else "min",
             "align_start": align_var.get(),
             "mark": MARK_LABELS.get(mark_var.get(), "none"),
             "curve_marks": dict(mark_map),
